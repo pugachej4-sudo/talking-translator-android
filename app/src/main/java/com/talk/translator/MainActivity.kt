@@ -10,8 +10,11 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
+import android.os.Build
 import android.os.Bundle
 import android.speech.RecognitionListener
+import android.speech.RecognitionSupport
+import android.speech.RecognitionSupportCallback
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
@@ -89,7 +92,9 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        tts = TextToSpeech(this) { }
+        tts = TextToSpeech(this) { st ->
+            if (st == TextToSpeech.SUCCESS) { ttsReady = true; ensureTts(src()); ensureTts(dst()) }
+        }
 
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; fitsSystemWindows = true; setBackgroundColor(Color.WHITE) }
 
@@ -131,8 +136,8 @@ class MainActivity : Activity() {
             addView(circle("✕", Color.LTGRAY, 52) { clearAll() })
         }
         val names = langs.map { it.name }
-        spSrc = Spinner(this).apply { adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, names); setSelection(0) }
-        spDst = Spinner(this).apply { adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, names); setSelection(1) }
+        spSrc = makeSpinner(names, 0)
+        spDst = makeSpinner(names, 1)
         val lp = { LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f) }
         val langRow = LinearLayout(this).apply {
             gravity = Gravity.CENTER_VERTICAL; setPadding(dp(12), 0, dp(12), dp(12))
@@ -177,6 +182,14 @@ class MainActivity : Activity() {
                 }
                 override fun onError(code: Int) {
                     idle()
+                    if (code == 12 || code == 13) {   // язык не поддерживается / пакет не скачан
+                        ensureSpeech(a, true)
+                        botTv.text = if (Build.VERSION.SDK_INT >= 33)
+                            "Скачиваю речевой пакет «${a.name}»… Подождите минуту и повторите."
+                        else
+                            "Нужен речевой пакет «${a.name}»: Настройки → Google → Голосовой ввод → Офлайн-распознавание."
+                        return
+                    }
                     botTv.text = "Ошибка распознавания ($code). Для офлайна скачайте речевой пакет: Настройки телефона → Google → Голосовой ввод → Офлайн-распознавание."
                 }
                 override fun onResults(r: Bundle?) {
@@ -203,6 +216,80 @@ class MainActivity : Activity() {
     override fun onRequestPermissionsResult(c: Int, p: Array<out String>, g: IntArray) {
         if (g.isNotEmpty() && g[0] == PackageManager.PERMISSION_GRANTED && pendingSide != -1) listen(pendingSide)
         pendingSide = -1
+    }
+
+    // ---------- автозагрузка пакетов при выборе языка ----------
+    private val prepared = HashSet<String>()
+    private val asked = HashSet<String>()
+    private val helpers = ArrayList<SpeechRecognizer>()
+    private var ttsReady = false
+
+    private fun makeSpinner(names: List<String>, sel: Int) = Spinner(this).apply {
+        adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, names)
+        setSelection(sel)
+        onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) { ensureLang(langs[pos]) }
+            override fun onNothingSelected(p: AdapterView<*>?) {}
+        }
+    }
+
+    private fun ensureLang(l: Lang) { ensureModel(l); ensureSpeech(l, false); ensureTts(l) }
+
+    // 1) модель перевода (ML Kit)
+    private fun ensureModel(l: Lang) {
+        if (l.ml == TranslateLanguage.ENGLISH) return
+        val mm = RemoteModelManager.getInstance()
+        val m = TranslateRemoteModel.Builder(l.ml).build()
+        mm.isModelDownloaded(m).addOnSuccessListener { ok ->
+            if (!ok) {
+                botTv.text = "Скачиваю язык «${l.name}» для перевода…"
+                mm.download(m, DownloadConditions.Builder().build())
+                    .addOnSuccessListener { botTv.text = "Язык «${l.name}» скачан ✓" }
+                    .addOnFailureListener { botTv.text = "Не удалось скачать «${l.name}». Нужен интернет." }
+            }
+        }
+    }
+
+    // 2) офлайн-пакет распознавания речи (Android 13+)
+    private fun ensureSpeech(l: Lang, force: Boolean) {
+        if (Build.VERSION.SDK_INT < 33) return
+        if (!prepared.add("s:" + l.tag) && !force) return
+        try {
+            val r = SpeechRecognizer.createSpeechRecognizer(this)
+            helpers.add(r)
+            val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                .putExtra(RecognizerIntent.EXTRA_LANGUAGE, l.tag)
+            val pre = l.tag.substringBefore('-')
+            fun List<String>.has() = any { it.equals(l.tag, true) || it.substringBefore('-').equals(pre, true) }
+            r.checkRecognitionSupport(i, mainExecutor, object : RecognitionSupportCallback {
+                override fun onSupportResult(s: RecognitionSupport) {
+                    val installed = s.installedOnDeviceLanguages.has()
+                    val pending = s.pendingOnDeviceLanguages.has()
+                    val supported = s.supportedOnDeviceLanguages.has()
+                    if (!installed && !pending && supported) {
+                        botTv.text = "Скачиваю речевой пакет «${l.name}»…"
+                        try { r.triggerModelDownload(i) } catch (e: Exception) { }
+                    }
+                }
+                override fun onError(error: Int) {}
+            })
+        } catch (e: Exception) { }
+    }
+
+    // 3) голос для озвучки
+    private fun ensureTts(l: Lang) {
+        val t = tts ?: return
+        if (!ttsReady || !asked.add("t:" + l.tag)) return
+        if (t.isLanguageAvailable(Locale.forLanguageTag(l.tag)) == TextToSpeech.LANG_MISSING_DATA) {
+            AlertDialog.Builder(this).setTitle("Голос для озвучки")
+                .setMessage("Для озвучки языка «${l.name}» нужно скачать голос. Открыть установку?")
+                .setPositiveButton("Да") { _, _ ->
+                    try { startActivity(Intent(TextToSpeech.Engine.ACTION_INSTALL_TTS_DATA)) } catch (e: Exception) {
+                        Toast.makeText(this, "Настройки → Синтез речи → Установить голосовые данные", Toast.LENGTH_LONG).show()
+                    }
+                }.setNegativeButton("Позже", null).show()
+        }
     }
 
     // ---------- перевод ----------
@@ -315,5 +402,5 @@ class MainActivity : Activity() {
         Toast.makeText(this, "Скопировано", Toast.LENGTH_SHORT).show()
     }
 
-    override fun onDestroy() { rec?.destroy(); tts?.shutdown(); super.onDestroy() }
+    override fun onDestroy() { helpers.forEach { it.destroy() }; rec?.destroy(); tts?.shutdown(); super.onDestroy() }
 }
