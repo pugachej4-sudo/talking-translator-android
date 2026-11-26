@@ -4,15 +4,19 @@ import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.ClipData
+import android.content.ComponentName
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import android.speech.RecognitionListener
+import android.speech.RecognitionService
 import android.speech.RecognitionSupport
 import android.speech.RecognitionSupportCallback
 import android.speech.RecognizerIntent
@@ -92,9 +96,7 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        tts = TextToSpeech(this) { st ->
-            if (st == TextToSpeech.SUCCESS) { ttsReady = true; ensureTts(src()); ensureTts(dst()) }
-        }
+        initTts("com.google.android.tts")
 
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; fitsSystemWindows = true; setBackgroundColor(Color.WHITE) }
 
@@ -152,6 +154,7 @@ class MainActivity : Activity() {
         }
         root.addView(top); root.addView(bottom)
         setContentView(root)
+        root.post { runSetup() }
     }
 
     // ---------- распознавание ----------
@@ -168,7 +171,7 @@ class MainActivity : Activity() {
         val a = if (side == 0) src() else dst()
         val b = if (side == 0) dst() else src()
         rec?.destroy()
-        rec = SpeechRecognizer.createSpeechRecognizer(this).apply {
+        rec = newRecognizer().apply {
             setRecognitionListener(object : RecognitionListener {
                 override fun onReadyForSpeech(p: Bundle?) {}
                 override fun onBeginningOfSpeech() {}
@@ -214,8 +217,30 @@ class MainActivity : Activity() {
     private fun idle() { listeningSide = -1; micBot.text = "🎙"; micTop.text = "🎙" }
 
     override fun onRequestPermissionsResult(c: Int, p: Array<out String>, g: IntArray) {
+        if (c == 2) { runSetup(); return }
         if (g.isNotEmpty() && g[0] == PackageManager.PERMISSION_GRANTED && pendingSide != -1) listen(pendingSide)
         pendingSide = -1
+    }
+
+    // ---------- Samsung: принудительно используем службы Google ----------
+    private fun newRecognizer(): SpeechRecognizer {
+        val cn = ComponentName("com.google.android.googlequicksearchbox",
+            "com.google.android.voicesearch.serviceapi.GoogleRecognitionService")
+        return try {
+            val found = packageManager.queryIntentServices(
+                Intent(RecognitionService.SERVICE_INTERFACE).setComponent(cn), 0).isNotEmpty()
+            if (found) SpeechRecognizer.createSpeechRecognizer(this, cn)
+            else SpeechRecognizer.createSpeechRecognizer(this)
+        } catch (e: Exception) { SpeechRecognizer.createSpeechRecognizer(this) }
+    }
+
+    private fun initTts(engine: String?) {
+        ttsEngine = engine
+        val cb = TextToSpeech.OnInitListener { st ->
+            if (st == TextToSpeech.SUCCESS) { ttsReady = true; runSetup() }
+            else if (engine != null) initTts(null)   // Google TTS нет — берём системный
+        }
+        tts = if (engine != null) TextToSpeech(this, cb, engine) else TextToSpeech(this, cb)
     }
 
     // ---------- автозагрузка пакетов при выборе языка ----------
@@ -255,7 +280,7 @@ class MainActivity : Activity() {
         if (Build.VERSION.SDK_INT < 33) return
         if (!prepared.add("s:" + l.tag) && !force) return
         try {
-            val r = SpeechRecognizer.createSpeechRecognizer(this)
+            val r = newRecognizer()
             helpers.add(r)
             val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
                 .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
@@ -277,19 +302,79 @@ class MainActivity : Activity() {
         } catch (e: Exception) { }
     }
 
-    // 3) голос для озвучки
-    private fun ensureTts(l: Lang) {
-        val t = tts ?: return
-        if (!ttsReady || !asked.add("t:" + l.tag)) return
-        if (t.isLanguageAvailable(Locale.forLanguageTag(l.tag)) == TextToSpeech.LANG_MISSING_DATA) {
-            AlertDialog.Builder(this).setTitle("Голос для озвучки")
-                .setMessage("Для озвучки языка «${l.name}» нужно скачать голос. Открыть установку?")
-                .setPositiveButton("Да") { _, _ ->
-                    try { startActivity(Intent(TextToSpeech.Engine.ACTION_INSTALL_TTS_DATA)) } catch (e: Exception) {
-                        Toast.makeText(this, "Настройки → Синтез речи → Установить голосовые данные", Toast.LENGTH_LONG).show()
-                    }
-                }.setNegativeButton("Позже", null).show()
+    private fun ensureTts(l: Lang) { if (ttsReady) runSetup() }
+
+    // ---------- мастер настройки: одно нажатие «Да» на каждый шаг ----------
+    private val GOOGLE = "com.google.android.googlequicksearchbox"
+    private val GTTS = "com.google.android.tts"
+    private val wizardSeen = HashSet<String>()
+    private var dialogOpen = false
+    private var resumeWizard = false
+    private var ttsEngine: String? = null
+    private var ttsRetry = 0
+
+    private fun installed(pkg: String) =
+        try { packageManager.getPackageInfo(pkg, 0); true } catch (e: Exception) { false }
+
+    private fun openPlay(pkg: String) {
+        try { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("market://details?id=$pkg"))) }
+        catch (e: Exception) {
+            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://play.google.com/store/apps/details?id=$pkg")))
         }
+    }
+
+    // true — показали окно (ждём ответа), false — шаг уже был показан
+    private fun ask(key: String, title: String, msg: String, yes: String, action: () -> Unit): Boolean {
+        if (dialogOpen) return true
+        if (!wizardSeen.add(key)) return false
+        dialogOpen = true
+        AlertDialog.Builder(this).setTitle(title).setMessage(msg).setCancelable(false)
+            .setPositiveButton(yes) { _, _ ->
+                dialogOpen = false; resumeWizard = true
+                try { action() } catch (e: Exception) { resumeWizard = false; runSetup() }
+            }
+            .setNegativeButton("Позже") { _, _ -> dialogOpen = false; runSetup() }
+            .show()
+        return true
+    }
+
+    private fun runSetup() {
+        if (dialogOpen) return
+        // 1. микрофон
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED
+            && wizardSeen.add("mic")) {
+            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 2); return
+        }
+        // 2. приложение Google (распознавание речи)
+        if (!installed(GOOGLE) && ask("g", "Нужно приложение Google",
+                "Для распознавания речи нужно приложение «Google». Открыть Google Play? Останется нажать «Установить».",
+                "Да, открыть") { openPlay(GOOGLE) }) return
+        // 3. Службы речи Google (нейроголоса)
+        if (!installed(GTTS) && ask("t", "Нейроголоса Google",
+                "Для качественной озвучки нужны «Службы речи от Google». Открыть Google Play? Останется нажать «Установить».",
+                "Да, открыть") { openPlay(GTTS) }) return
+        // 4. голоса выбранных языков
+        if (ttsReady) {
+            val miss = listOf(src(), dst()).filter {
+                tts?.isLanguageAvailable(Locale.forLanguageTag(it.tag)) == TextToSpeech.LANG_MISSING_DATA
+            }
+            if (miss.isNotEmpty() && ask("v:" + miss.joinToString { it.tag }, "Голоса для озвучки",
+                    "Нужно скачать голоса: ${miss.joinToString { it.name }}. Открыть список голосов? Нажмите на язык и значок загрузки.",
+                    "Да, открыть") { startActivity(Intent(TextToSpeech.Engine.ACTION_INSTALL_TTS_DATA)) }) return
+        }
+        // 5. речевой пакет на Android 12 и старше (на 13+ он скачивается сам)
+        if (Build.VERSION.SDK_INT < 33 && ask("sp", "Офлайн-распознавание речи",
+                "Откройте настройки голосового ввода и скачайте офлайн-пакеты нужных языков. Открыть настройки?",
+                "Да, открыть") { startActivity(Intent(Settings.ACTION_VOICE_INPUT_SETTINGS)) }) return
+    }
+
+    override fun onResume() {
+        super.onResume()
+        val rw = resumeWizard; resumeWizard = false
+        if (ttsEngine != GTTS && ttsRetry < 3 && installed(GTTS)) {
+            ttsRetry++; ttsReady = false; tts?.shutdown(); initTts(GTTS); return
+        }
+        if (rw) runSetup()
     }
 
     // ---------- перевод ----------
@@ -337,12 +422,14 @@ class MainActivity : Activity() {
             menu.add(0, 2, 1, "История")
             menu.add(0, 3, 2, "Избранное")
             menu.add(0, 4, 3, "Скачать языки для офлайна")
+            menu.add(0, 5, 4, "Мастер настройки")
             setOnMenuItemClickListener {
                 when (it.itemId) {
                     1 -> { online = !online; Toast.makeText(this@MainActivity, if (online) "Онлайн" else "Офлайн", Toast.LENGTH_SHORT).show() }
                     2 -> showHist(false)
                     3 -> showHist(true)
                     4 -> downloadLangs()
+                    5 -> { wizardSeen.clear(); prepared.clear(); ensureLang(src()); ensureLang(dst()); runSetup() }
                 }
                 true
             }
