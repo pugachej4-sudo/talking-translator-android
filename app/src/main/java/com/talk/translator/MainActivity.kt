@@ -242,6 +242,19 @@ class MainActivity : Activity() {
                         ui.postDelayed({ if (listeningSide == -1) listen(side, true) }, 300)
                         return
                     }
+                    if (code != 9 && code != 7 && code != 6) {
+                        if (voskReady(a)) {
+                            botTv.text = "Переключаюсь на офлайн-распознавание…"
+                            ui.postDelayed({ if (listeningSide == -1) listenVosk(side, a, b) }, 200)
+                            return
+                        }
+                        if (!useDefaultRec) {
+                            useDefaultRec = true
+                            botTv.text = "Пробую другую службу распознавания…"
+                            ui.postDelayed({ if (listeningSide == -1) listen(side, true) }, 300)
+                            return
+                        }
+                    }
                     failCount++
                     val sp = getSharedPreferences("tt", MODE_PRIVATE)
                     if (failCount >= 2 && !sp.getBoolean("sys", false)) {
@@ -277,7 +290,10 @@ class MainActivity : Activity() {
     }
 
     // ---------- Samsung: принудительно используем службы Google ----------
+    private var useDefaultRec = false
+
     private fun newRecognizer(): SpeechRecognizer {
+        if (useDefaultRec) return SpeechRecognizer.createSpeechRecognizer(this)
         val cn = ComponentName("com.google.android.googlequicksearchbox",
             "com.google.android.voicesearch.serviceapi.GoogleRecognitionService")
         return try {
@@ -684,9 +700,11 @@ class MainActivity : Activity() {
     private fun showSettings() {
         val sp = getSharedPreferences("tt", MODE_PRIVATE)
         val auto = sp.getBoolean("auto", true)
+        val llmState = if (!llmReady()) "не установлена" else if (sp.getBoolean("llm", false)) "ВКЛ" else "ВЫКЛ"
         val items = arrayOf(
             "Обновить приложение (версия ${BuildConfig.VERSION_CODE})",
             "Языки для офлайна: что скачано / скачать ещё",
+            "ИИ-перевод офлайн (лучшее качество): $llmState",
             "Обновить языковые пакеты",
             "Автообновление при запуске: " + if (auto) "ВКЛ" else "ВЫКЛ",
             "Режим перевода: " + modeName(),
@@ -696,13 +714,14 @@ class MainActivity : Activity() {
             when (i) {
                 0 -> checkUpdate(false)
                 1 -> showLangManager()
-                2 -> updateLangs(false)
-                3 -> { sp.edit().putBoolean("auto", !auto).apply()
+                2 -> showLlmDialog()
+                3 -> updateLangs(false)
+                4 -> { sp.edit().putBoolean("auto", !auto).apply()
                        Toast.makeText(this, if (!auto) "Автообновление включено" else "Автообновление выключено", Toast.LENGTH_SHORT).show() }
-                4 -> showModeDialog()
-                5 -> { val v = !sp.getBoolean("sys", false); sp.edit().putBoolean("sys", v).apply(); failCount = 0
+                5 -> showModeDialog()
+                6 -> { val v = !sp.getBoolean("sys", false); sp.edit().putBoolean("sys", v).apply(); failCount = 0
                        Toast.makeText(this, if (v) "Системное окно голосового ввода" else "Встроенное распознавание", Toast.LENGTH_SHORT).show() }
-                6 -> { wizardSeen.clear(); prepared.clear(); ensureLang(src()); ensureLang(dst()); runSetup() }
+                7 -> { wizardSeen.clear(); prepared.clear(); ensureLang(src()); ensureLang(dst()); runSetup() }
             }
         }.show()
     }
@@ -726,6 +745,7 @@ class MainActivity : Activity() {
     @Suppress("DEPRECATION")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == 4) { if (resultCode == RESULT_OK) data?.data?.let { importLlm(it) }; return }
         if (requestCode != 3) return
         val t = data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull()
         val a = dlgA; val b = dlgB
@@ -974,8 +994,205 @@ class MainActivity : Activity() {
         }
     }
 
-    // ---------- перевод ----------
+    // ---------- перевод: онлайн (Google) → офлайн (ИИ-модель или ML Kit) ----------
     private fun translate(side: Int, text: String, a: Lang, b: Lang) {
+        botTv.text = "Перевожу…"
+        if (online) {
+            thread {
+                val r = try { googleTranslate(text, a, b) } catch (e: Exception) { null }
+                runOnUiThread {
+                    if (!r.isNullOrBlank()) { show(side, text, r, a, b); speak(r, b) }
+                    else translateOffline(side, text, a, b)
+                }
+            }
+        } else translateOffline(side, text, a, b)
+    }
+
+    private fun translateOffline(side: Int, text: String, a: Lang, b: Lang) {
+        if (getSharedPreferences("tt", MODE_PRIVATE).getBoolean("llm", false) && llmReady()) translateLlm(side, text, a, b)
+        else translateMl(side, text, a, b)
+    }
+
+    private fun gcode(l: Lang) = if (l.ml == TranslateLanguage.CHINESE) "zh-CN" else l.tag.substringBefore('-')
+
+    private fun googleTranslate(text: String, a: Lang, b: Lang): String? {
+        val u = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=${gcode(a)}&tl=${gcode(b)}&dt=t&q=" +
+            java.net.URLEncoder.encode(text, "UTF-8")
+        val c = URL(u).openConnection() as HttpURLConnection
+        c.connectTimeout = 8000; c.readTimeout = 8000
+        c.setRequestProperty("User-Agent", "Mozilla/5.0")
+        if (c.responseCode != 200) return null
+        val arr = JSONArray(c.inputStream.bufferedReader().readText()).getJSONArray(0)
+        val sb = StringBuilder()
+        for (i in 0 until arr.length()) sb.append(arr.getJSONArray(i).optString(0))
+        return sb.toString().trim()
+    }
+
+    // ---------- офлайн ИИ-перевод (языковая модель на телефоне) ----------
+    private val DEFAULT_LLM_URL =
+        "https://huggingface.co/litert-community/Qwen2.5-1.5B-Instruct/resolve/main/Qwen2.5-1.5B-Instruct_multi-prefill-seq_q8_ekv1280.task"
+    private val enNames = mapOf("ru" to "Russian", "en" to "English", "de" to "German", "fr" to "French",
+        "es" to "Spanish", "it" to "Italian", "pt" to "Portuguese", "pl" to "Polish", "uk" to "Ukrainian",
+        "tr" to "Turkish", "zh" to "Chinese", "ja" to "Japanese", "ko" to "Korean", "ar" to "Arabic")
+    private fun enName(l: Lang) = enNames[l.tag.substringBefore('-')] ?: l.name
+    private val llmFile: File get() = File(filesDir, "llm/model.task")
+    private fun llmReady() = llmFile.exists() && llmFile.length() > 50_000_000L
+    private var llm: com.google.mediapipe.tasks.genai.llminference.LlmInference? = null
+
+    private fun llmPrompt(text: String, a: Lang, b: Lang): String {
+        val ins = "Translate the following text from ${enName(a)} to ${enName(b)}. Output only the translation, without any comments.\n\n$text"
+        val name = getSharedPreferences("tt", MODE_PRIVATE).getString("llmName", "") ?: ""
+        return if (name.contains("gemma", true)) "<start_of_turn>user\n$ins<end_of_turn>\n<start_of_turn>model\n"
+        else "<|im_start|>system\nYou are a professional translator.<|im_end|>\n<|im_start|>user\n$ins<|im_end|>\n<|im_start|>assistant\n"
+    }
+
+    private fun translateLlm(side: Int, text: String, a: Lang, b: Lang) {
+        botTv.text = "ИИ-перевод… (первый запуск модели может занять около минуты)"
+        thread {
+            try {
+                val m = synchronized(this) {
+                    llm ?: com.google.mediapipe.tasks.genai.llminference.LlmInference.createFromOptions(
+                        this,
+                        com.google.mediapipe.tasks.genai.llminference.LlmInference.LlmInferenceOptions.builder()
+                            .setModelPath(llmFile.absolutePath).setMaxTokens(768).build()
+                    ).also { llm = it }
+                }
+                var out = m.generateResponse(llmPrompt(text, a, b)).trim()
+                for (stop in listOf("<end_of_turn>", "<|im_end|>", "<|endoftext|>")) out = out.substringBefore(stop)
+                out = out.trim().trim('"', '«', '»').trim()
+                if (out.isBlank()) throw Exception("пустой ответ")
+                runOnUiThread { show(side, text, out, a, b); speak(out, b) }
+            } catch (e: Throwable) {
+                runOnUiThread {
+                    Toast.makeText(this, "ИИ-модель не сработала (${e.message}). Использую обычный перевод.", Toast.LENGTH_LONG).show()
+                    translateMl(side, text, a, b)
+                }
+            }
+        }
+    }
+
+    private fun finishLlm(name: String) {
+        getSharedPreferences("tt", MODE_PRIVATE).edit().putString("llmName", name).putBoolean("llm", true).apply()
+        try { llm?.close() } catch (e: Throwable) { }
+        llm = null
+    }
+
+    private fun downloadLlm(url: String) {
+        val k = "ИИ-модель перевода"
+        if (tasks.containsKey(k)) return
+        taskStart(k, 0, 7200000)
+        thread {
+            try {
+                val dir = File(filesDir, "llm"); dir.mkdirs()
+                val tmp = File(dir, "model.part")
+                val c = URL(url).openConnection() as HttpURLConnection
+                c.connectTimeout = 20000; c.readTimeout = 60000
+                c.setRequestProperty("User-Agent", "TalkingTranslator")
+                if (c.responseCode == 401 || c.responseCode == 403)
+                    throw Exception("модель требует входа на сайте. Скачайте файл в браузере и выберите его кнопкой «Выбрать файл»")
+                if (c.responseCode != 200) throw Exception("HTTP ${c.responseCode}")
+                val total = c.contentLengthLong
+                c.inputStream.use { inp ->
+                    tmp.outputStream().use { out ->
+                        val buf = ByteArray(1 shl 16); var done = 0L; var last = -1
+                        while (true) {
+                            val n = inp.read(buf); if (n < 0) break
+                            out.write(buf, 0, n); done += n
+                            if (total > 0) {
+                                val pc = (done * 100 / total).toInt()
+                                if (pc != last) { last = pc; runOnUiThread { taskStart(k, pc) } }
+                            }
+                        }
+                    }
+                }
+                llmFile.delete(); tmp.renameTo(llmFile)
+                runOnUiThread { finishLlm(url.substringAfterLast('/').substringBefore('?')); taskDone(k, "ИИ-модель установлена ✓ Включена для офлайн-перевода.") }
+            } catch (e: Throwable) {
+                runOnUiThread { taskDone(k, "Не удалось скачать ИИ-модель: ${e.message}") }
+            }
+        }
+    }
+
+    private fun importLlm(uri: Uri) {
+        val k = "ИИ-модель перевода"
+        if (tasks.containsKey(k)) return
+        taskStart(k, -1, 7200000)
+        thread {
+            try {
+                var name = "model.task"; var size = -1L
+                contentResolver.query(uri, null, null, null, null)?.use { cur ->
+                    if (cur.moveToFirst()) {
+                        val ni = cur.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                        if (ni >= 0) name = cur.getString(ni)
+                        val si = cur.getColumnIndex(android.provider.OpenableColumns.SIZE)
+                        if (si >= 0) size = cur.getLong(si)
+                    }
+                }
+                val dir = File(filesDir, "llm"); dir.mkdirs()
+                val tmp = File(dir, "model.part")
+                val inp0 = contentResolver.openInputStream(uri) ?: throw Exception("не удалось открыть файл")
+                inp0.use { inp ->
+                    tmp.outputStream().use { out ->
+                        val buf = ByteArray(1 shl 16); var done = 0L; var last = -1
+                        while (true) {
+                            val n = inp.read(buf); if (n < 0) break
+                            out.write(buf, 0, n); done += n
+                            if (size > 0) {
+                                val pc = (done * 100 / size).toInt()
+                                if (pc != last) { last = pc; runOnUiThread { taskStart(k, pc) } }
+                            }
+                        }
+                    }
+                }
+                if (tmp.length() < 50_000_000L) throw Exception("файл слишком маленький, это не модель")
+                llmFile.delete(); tmp.renameTo(llmFile)
+                runOnUiThread { finishLlm(name); taskDone(k, "ИИ-модель установлена ✓ Включена для офлайн-перевода.") }
+            } catch (e: Throwable) {
+                runOnUiThread { taskDone(k, "Не удалось установить ИИ-модель: ${e.message}") }
+            }
+        }
+    }
+
+    private fun showLlmDialog() {
+        val sp = getSharedPreferences("tt", MODE_PRIVATE)
+        val status = TextView(this).apply { textSize = 15f; setTextColor(Color.BLACK) }
+        val url = EditText(this).apply { setText(sp.getString("llmUrl", DEFAULT_LLM_URL)); textSize = 12f }
+        val sw = Switch(this).apply { text = "Использовать для офлайн-перевода" }
+        fun refresh() {
+            status.text = if (llmReady()) "Модель установлена: ${sp.getString("llmName", "")} (${llmFile.length() / 1048576} МБ)"
+            else "Модель не установлена."
+            sw.isChecked = sp.getBoolean("llm", false) && llmReady()
+        }
+        sw.setOnCheckedChangeListener { _, v ->
+            if (v && !llmReady()) { sw.isChecked = false; Toast.makeText(this, "Сначала установите модель", Toast.LENGTH_SHORT).show() }
+            else sp.edit().putBoolean("llm", v).apply()
+        }
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(8), dp(20), dp(8)) }
+        val d = AlertDialog.Builder(this).setTitle("ИИ-перевод офлайн (лучшее качество)")
+            .setView(ScrollView(this).apply { addView(col) })
+            .setPositiveButton("Готово", null).create()
+        fun btn(t: String, onClick: () -> Unit) = Button(this).apply { text = t; setOnClickListener { onClick() } }
+        col.addView(status); col.addView(sw)
+        col.addView(TextView(this).apply { text = "\nСсылка на файл модели (.task, 0,5–3 ГБ):"; textSize = 13f })
+        col.addView(url)
+        col.addView(btn("Скачать по ссылке") {
+            val u = url.text.toString().trim()
+            sp.edit().putString("llmUrl", u).apply(); d.dismiss(); downloadLlm(u)
+        })
+        col.addView(btn("Выбрать файл на телефоне") {
+            d.dismiss()
+            startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*"), 4)
+        })
+        col.addView(btn("Удалить модель") {
+            try { llm?.close() } catch (e: Throwable) { }
+            llm = null; llmFile.delete(); sp.edit().putBoolean("llm", false).apply(); refresh()
+        })
+        refresh()
+        d.show()
+    }
+
+    // ---------- перевод ----------
+    private fun translateMl(side: Int, text: String, a: Lang, b: Lang) {
         botTv.text = "Перевожу…"
         val t = Translation.getClient(
             TranslatorOptions.Builder().setSourceLanguage(a.ml).setTargetLanguage(b.ml).build())
@@ -1076,5 +1293,5 @@ class MainActivity : Activity() {
         Toast.makeText(this, "Скопировано", Toast.LENGTH_SHORT).show()
     }
 
-    override fun onDestroy() { try { unregisterReceiver(installReceiver) } catch (e: Exception) { }; shutdownVosk(); voskCache.values.forEach { try { it.close() } catch (e: Throwable) { } }; helpers.forEach { it.destroy() }; rec?.destroy(); tts?.shutdown(); super.onDestroy() }
+    override fun onDestroy() { try { unregisterReceiver(installReceiver) } catch (e: Exception) { }; try { llm?.close() } catch (e: Throwable) { }; shutdownVosk(); voskCache.values.forEach { try { it.close() } catch (e: Throwable) { } }; helpers.forEach { it.destroy() }; rec?.destroy(); tts?.shutdown(); super.onDestroy() }
 }
