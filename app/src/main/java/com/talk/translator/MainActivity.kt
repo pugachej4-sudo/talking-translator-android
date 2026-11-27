@@ -185,13 +185,16 @@ class MainActivity : Activity() {
     private var retryLeft = 1
 
     private fun listen(side: Int, retry: Boolean = false) {
-        if (listeningSide == side) { rec?.stopListening(); return }
+        if (listeningSide == side) { if (vosk != null) vosk?.stop() else rec?.stopListening(); return }
         if (listeningSide != -1) return
         if (!retry) retryLeft = 1
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             pendingSide = side
             requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 1); return
         }
+        val a0 = if (side == 0) src() else dst()
+        val b0 = if (side == 0) dst() else src()
+        if (!online && voskReady(a0)) { listenVosk(side, a0, b0); return }
         if (!SpeechRecognizer.isRecognitionAvailable(this)) {
             botTv.text = "Нет службы распознавания речи. Установите приложение «Google»."; return
         }
@@ -224,8 +227,6 @@ class MainActivity : Activity() {
                     idle()
                     if (code == 12 || code == 13) {   // язык не поддерживается / пакет не скачан
                         ensureSpeech(a, true)
-                        if (Build.VERSION.SDK_INT < 33)
-                            botTv.text = "Нужен речевой пакет «${a.name}»: Настройки → Google → Голосовой ввод → Офлайн-распознавание."
                         return
                     }
                     if ((code == 1 || code == 2) && mode == 2 && !autoForceOffline) {
@@ -325,50 +326,149 @@ class MainActivity : Activity() {
         }
     }
 
-    // 2) офлайн-пакет распознавания речи (Android 13+)
+    // 2) офлайн-распознавание речи: собственные модели Vosk (не зависят от Google)
+    private val voskNames = mapOf(
+        "ru" to "vosk-model-small-ru-0.22", "en" to "vosk-model-small-en-us-0.15",
+        "es" to "vosk-model-small-es-0.42", "de" to "vosk-model-small-de-0.15",
+        "fr" to "vosk-model-small-fr-0.22", "it" to "vosk-model-small-it-0.22",
+        "pt" to "vosk-model-small-pt-0.3", "pl" to "vosk-model-small-pl-0.22",
+        "uk" to "vosk-model-small-uk-v3-small", "tr" to "vosk-model-small-tr-0.3",
+        "zh" to "vosk-model-small-cn-0.22", "ja" to "vosk-model-small-ja-0.22",
+        "ko" to "vosk-model-small-ko-0.22")
+
+    private fun voskKey(l: Lang) = l.tag.substringBefore('-')
+    private fun voskUrl(l: Lang): String? = voskNames[voskKey(l)]?.let { "https://alphacephei.com/vosk/models/$it.zip" }
+    private fun voskDir(l: Lang) = File(filesDir, "vosk/" + voskKey(l))
+    private fun voskReady(l: Lang) = File(voskDir(l), ".ok").exists()
+    private fun voskPath(l: Lang): String? {
+        val d = voskDir(l)
+        if (File(d, "am").isDirectory) return d.absolutePath
+        return d.listFiles()?.firstOrNull { it.isDirectory && File(it, "am").isDirectory }?.absolutePath
+    }
+
     private fun ensureSpeech(l: Lang, force: Boolean) {
-        if (Build.VERSION.SDK_INT < 33) return
-        val sp0 = getSharedPreferences("tt", MODE_PRIVATE)
-        val spKey = "sp:" + l.tag
-        if (!force) {
-            if (!prepared.add(spKey)) return
-            if (System.currentTimeMillis() - sp0.getLong(spKey, 0) < 3L * 24 * 3600 * 1000) return
-        }
-        try {
-            val r = newRecognizer()
-            helpers.add(r)
-            val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
-                .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                .putExtra(RecognizerIntent.EXTRA_LANGUAGE, l.tag)
-            val pre = l.tag.substringBefore('-')
-            fun List<String>.has() = any { it.equals(l.tag, true) || it.substringBefore('-').equals(pre, true) }
-            r.checkRecognitionSupport(i, mainExecutor, object : RecognitionSupportCallback {
-                override fun onSupportResult(s: RecognitionSupport) {
-                    val installed = s.installedOnDeviceLanguages.has()
-                    val pending = s.pendingOnDeviceLanguages.has()
-                    val supported = s.supportedOnDeviceLanguages.has()
-                    if (!installed && !pending && supported) {
-                        val k = "Речевой пакет: ${l.name}"
-                        sp0.edit().putLong(spKey, System.currentTimeMillis()).apply()
-                        taskStart(k, -1, 300000)
-                        pollSpeech(r, i, l, k, 75)
-                        try {
-                            if (Build.VERSION.SDK_INT >= 34) {
-                                r.triggerModelDownload(i, mainExecutor, object : ModelDownloadListener {
-                                    override fun onProgress(completedPercent: Int) { taskStart(k, completedPercent) }
-                                    override fun onSuccess() { taskDone(k, "Речевой пакет «${l.name}» скачан ✓") }
-                                    override fun onScheduled() { taskStart(k, -1) }
-                                    override fun onError(error: Int) {
-                                        taskDone(k, "Речевой пакет «${l.name}» не скачался (код $error). Онлайн-режим работает и без него.")
-                                    }
-                                })
-                            } else r.triggerModelDownload(i)
-                        } catch (e: Exception) { taskDone(k, "Речевой пакет «${l.name}» скачать не удалось. Онлайн-режим работает и без него.") }
+        if (voskUrl(l) == null || voskReady(l) || tasks.containsKey("Речевой пакет: ${l.name}")) return
+        if (!hasNet()) return
+        if (force) { downloadVosk(l); return }
+        if (!prepared.add("v:" + l.tag)) return
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        if (!cm.isActiveNetworkMetered) downloadVosk(l)
+        else ask("vm:" + l.tag, "Речевой пакет для офлайна",
+            "Скачать офлайн-распознавание речи для языка «${l.name}» (около 50 МБ) по мобильному интернету?",
+            "Да, скачать") { downloadVosk(l) }
+    }
+
+    private fun downloadVosk(l: Lang) {
+        val url = voskUrl(l) ?: return
+        val k = "Речевой пакет: ${l.name}"
+        if (tasks.containsKey(k)) return
+        taskStart(k, 0, 1800000)
+        thread {
+            try {
+                val zip = File(cacheDir, "vosk_${voskKey(l)}.zip")
+                val c = URL(url).openConnection() as HttpURLConnection
+                c.connectTimeout = 20000; c.readTimeout = 30000
+                if (c.responseCode != 200) throw Exception("HTTP ${c.responseCode}")
+                val total = c.contentLengthLong
+                c.inputStream.use { inp ->
+                    zip.outputStream().use { out ->
+                        val buf = ByteArray(65536); var done = 0L; var last = -1
+                        while (true) {
+                            val n = inp.read(buf); if (n < 0) break
+                            out.write(buf, 0, n); done += n
+                            if (total > 0) {
+                                val p = (done * 95 / total).toInt()
+                                if (p != last) { last = p; runOnUiThread { taskStart(k, p) } }
+                            }
+                        }
                     }
                 }
-                override fun onError(error: Int) {}
-            })
-        } catch (e: Exception) { }
+                runOnUiThread { taskStart(k, 96) }
+                val dir = voskDir(l); dir.deleteRecursively(); dir.mkdirs()
+                unzip(zip, dir); zip.delete()
+                File(dir, ".ok").writeText("ok")
+                runOnUiThread { taskDone(k, "Речевой пакет «${l.name}» установлен ✓ Офлайн-распознавание готово.") }
+            } catch (e: Throwable) {
+                runOnUiThread { taskDone(k, "Не удалось скачать речевой пакет «${l.name}»: ${e.message}. Проверьте интернет и повторите.") }
+            }
+        }
+    }
+
+    private fun unzip(zip: File, dest: File) {
+        java.util.zip.ZipInputStream(zip.inputStream().buffered()).use { zis ->
+            var e = zis.nextEntry
+            while (e != null) {
+                val f = File(dest, e.name)
+                if (!f.canonicalPath.startsWith(dest.canonicalPath)) throw Exception("bad zip")
+                if (e.isDirectory) f.mkdirs() else { f.parentFile?.mkdirs(); f.outputStream().use { zis.copyTo(it) } }
+                zis.closeEntry(); e = zis.nextEntry
+            }
+        }
+    }
+
+    private var vosk: org.vosk.android.SpeechService? = null
+    private val voskCache = LinkedHashMap<String, org.vosk.Model>()
+
+    private fun shutdownVosk() {
+        val v = vosk ?: return
+        vosk = null
+        try { v.stop() } catch (e: Throwable) { }
+        try { v.shutdown() } catch (e: Throwable) { }
+    }
+
+    private fun listenVosk(side: Int, a: Lang, b: Lang) {
+        val path = voskPath(a)
+        if (path == null) { botTv.text = "Речевой пакет повреждён. Скачайте заново: ⚙ → Языки для офлайна."; return }
+        listeningSide = side
+        (if (side == 0) micBot else micTop).text = "⏹"
+        botTv.text = "Загружаю офлайн-модель…"
+        thread {
+            try {
+                val key = voskKey(a)
+                val model = synchronized(voskCache) {
+                    voskCache[key] ?: run {
+                        while (voskCache.size >= 2) { val k0 = voskCache.keys.first(); voskCache.remove(k0)?.close() }
+                        org.vosk.Model(path).also { voskCache[key] = it }
+                    }
+                }
+                runOnUiThread { startVosk(side, a, b, model) }
+            } catch (e: Throwable) {
+                runOnUiThread { idle(); botTv.text = "Не удалось загрузить офлайн-модель: ${e.message}" }
+            }
+        }
+    }
+
+    private fun startVosk(side: Int, a: Lang, b: Lang, model: org.vosk.Model) {
+        if (listeningSide != side) return
+        try {
+            val svc = org.vosk.android.SpeechService(org.vosk.Recognizer(model, 16000f), 16000f)
+            vosk = svc
+            var done = false
+            fun finish(t: String) {
+                if (done) return
+                done = true; shutdownVosk(); idle(); failCount = 0
+                translate(side, t, a, b)
+            }
+            fun fail(msg: String) {
+                if (done) return
+                done = true; shutdownVosk(); idle(); botTv.text = msg
+            }
+            fun jf(h: String?, f: String) = try { JSONObject(h ?: "{}").optString(f) } catch (e: Exception) { "" }
+            botTv.text = "Слушаю… (офлайн)"
+            svc.startListening(object : org.vosk.android.RecognitionListener {
+                override fun onPartialResult(h: String?) {
+                    val t = jf(h, "partial")
+                    if (t.isNotBlank() && !done) { if (side == 0) botTv.text = t else topTv.text = t }
+                }
+                override fun onResult(h: String?) { val t = jf(h, "text"); if (t.isNotBlank()) finish(t) }
+                override fun onFinalResult(h: String?) {
+                    val t = jf(h, "text")
+                    if (t.isNotBlank()) finish(t) else fail("Речь не распознана. Нажмите микрофон и повторите.")
+                }
+                override fun onError(e: Exception?) { fail("Ошибка офлайн-распознавания: ${e?.message}") }
+                override fun onTimeout() { fail("Не услышал речь. Нажмите микрофон и повторите.") }
+            }, 15000)
+        } catch (e: Throwable) { idle(); botTv.text = "Ошибка запуска офлайн-распознавания: ${e.message}" }
     }
 
     private fun ensureTts(l: Lang) { if (ttsReady) runSetup() }
@@ -577,7 +677,7 @@ class MainActivity : Activity() {
                 }
             }
         }
-        prepared.clear(); ensureSpeech(src(), true); ensureSpeech(dst(), true)
+        prepared.clear(); ensureSpeech(src(), !silent); ensureSpeech(dst(), !silent)
         getSharedPreferences("tt", MODE_PRIVATE).edit().putLong("langUpd", System.currentTimeMillis()).apply()
     }
 
@@ -750,13 +850,19 @@ class MainActivity : Activity() {
         RemoteModelManager.getInstance().getDownloadedModels(TranslateRemoteModel::class.java)
             .addOnCompleteListener { task ->
                 val codes: Set<String> = if (task.isSuccessful) task.result.map { it.language }.toSet() else emptySet()
+                var called = false
                 fun finish(installed: List<String>?) {
+                    if (called) return
+                    called = true
                     val m = LinkedHashMap<String, Status>()
                     langs.forEach { l ->
-                        m[l.tag] = Status(l.ml == TranslateLanguage.ENGLISH || l.ml in codes, installed?.hasLang(l), ttsOffline(l))
+                        val g = installed?.hasLang(l)
+                        val sp = if (voskReady(l) || g == true) true else if (installed != null || voskUrl(l) != null) false else null
+                        m[l.tag] = Status(l.ml == TranslateLanguage.ENGLISH || l.ml in codes, sp, ttsOffline(l))
                     }
                     cb(m)
                 }
+                ui.postDelayed({ finish(null) }, 3000)
                 if (Build.VERSION.SDK_INT >= 33) {
                     try {
                         val r = newRecognizer(); helpers.add(r)
@@ -779,27 +885,53 @@ class MainActivity : Activity() {
             fun mark(b: Boolean?) = when (b) { true -> "✓"; false -> "✗"; null -> "?" }
             val labels = langs.map { l ->
                 val s = st[l.tag]!!
-                "${l.name}\n   перевод ${mark(s.tr)}   речь ${mark(s.sp)}   голос ${mark(s.tts)}"
-            }.toTypedArray()
-            val dlg = AlertDialog.Builder(this)
-                .setTitle("Языки для офлайна (✓ есть, ✗ нет, ? неизвестно)")
-                .setMultiChoiceItems(labels, BooleanArray(langs.size), null)
-                .setPositiveButton("Скачать выбранные", null)
-                .setNeutralButton("Выбрать недостающие", null)
-                .setNegativeButton("Закрыть", null).create()
-            dlg.show()
-            dlg.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener {
-                langs.forEachIndexed { i, l ->
-                    val s = st[l.tag]!!
-                    if (!s.tr || s.sp == false || !s.tts) dlg.listView.setItemChecked(i, true)
+                "${l.name}\n   перевод ${mark(s.tr)} · речь ${mark(s.sp)} · голос ${mark(s.tts)}"
+            }
+            val d = android.app.Dialog(this)
+            d.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE)
+            val lv = ListView(this).apply {
+                choiceMode = ListView.CHOICE_MODE_MULTIPLE
+                adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_list_item_multiple_choice, labels)
+                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+            }
+            val head = LinearLayout(this).apply {
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(20), dp(8), dp(8), dp(4))
+                addView(TextView(this@MainActivity).apply {
+                    text = "Языки для офлайна"; textSize = 18f; setTextColor(Color.BLACK)
+                    typeface = android.graphics.Typeface.DEFAULT_BOLD
+                    layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                })
+                addView(TextView(this@MainActivity).apply {
+                    text = "✕"; textSize = 26f; setTextColor(Color.DKGRAY)
+                    setPadding(dp(14), dp(6), dp(14), dp(6))
+                    setOnClickListener { d.dismiss() }
+                })
+            }
+            val legend = TextView(this).apply {
+                text = "✓ есть   ✗ нет   ? неизвестно. Отметьте галочками, что скачать."
+                textSize = 13f; setTextColor(Color.GRAY); setPadding(dp(20), 0, dp(20), dp(6))
+            }
+            val btn = Button(this).apply {
+                text = "Скачать выбранные"; setTextColor(Color.WHITE)
+                background = GradientDrawable().apply { setColor(TEAL); cornerRadius = dp(26).toFloat() }
+                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(52)).apply { setMargins(dp(16), dp(8), dp(16), dp(16)) }
+                setOnClickListener {
+                    val pos = lv.checkedItemPositions
+                    val sel = langs.filterIndexed { i, _ -> pos.get(i) }
+                    if (sel.isEmpty()) Toast.makeText(this@MainActivity, "Отметьте языки галочками", Toast.LENGTH_SHORT).show()
+                    else { d.dismiss(); downloadSelected(sel, st) }
                 }
             }
-            dlg.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
-                val pos = dlg.listView.checkedItemPositions
-                val sel = langs.filterIndexed { i, _ -> pos.get(i) }
-                if (sel.isEmpty()) Toast.makeText(this, "Отметьте языки галочками", Toast.LENGTH_SHORT).show()
-                else { dlg.dismiss(); downloadSelected(sel, st) }
+            val root = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                background = GradientDrawable().apply { setColor(Color.WHITE); cornerRadius = dp(16).toFloat() }
+                addView(head); addView(legend); addView(lv); addView(btn)
             }
+            d.setContentView(root)
+            d.show()
+            d.window?.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, (resources.displayMetrics.heightPixels * 0.85).toInt())
+            d.window?.setBackgroundDrawableResource(android.R.color.transparent)
         }
     }
 
@@ -944,5 +1076,5 @@ class MainActivity : Activity() {
         Toast.makeText(this, "Скопировано", Toast.LENGTH_SHORT).show()
     }
 
-    override fun onDestroy() { try { unregisterReceiver(installReceiver) } catch (e: Exception) { }; helpers.forEach { it.destroy() }; rec?.destroy(); tts?.shutdown(); super.onDestroy() }
+    override fun onDestroy() { try { unregisterReceiver(installReceiver) } catch (e: Exception) { }; shutdownVosk(); voskCache.values.forEach { try { it.close() } catch (e: Throwable) { } }; helpers.forEach { it.destroy() }; rec?.destroy(); tts?.shutdown(); super.onDestroy() }
 }
