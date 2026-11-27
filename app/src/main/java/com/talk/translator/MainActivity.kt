@@ -19,6 +19,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import android.speech.ModelDownloadListener
 import android.speech.RecognitionListener
 import android.speech.RecognitionService
 import android.speech.RecognitionSupport
@@ -83,6 +84,7 @@ class MainActivity : Activity() {
     private lateinit var micBot: TextView
     private lateinit var spSrc: Spinner
     private lateinit var spDst: Spinner
+    private lateinit var pb: ProgressBar
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
     private fun src() = langs[spSrc.selectedItemPosition]
@@ -158,10 +160,15 @@ class MainActivity : Activity() {
             addView(icon("⇄", Color.DKGRAY) { swap() })
             addView(spDst, lp())
         }
+        pb = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 100; visibility = View.GONE
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                .apply { setMargins(dp(32), 0, dp(32), dp(8)) }
+        }
         val bottom = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
-            addView(tools); addView(botTv); addView(bar); addView(langRow)
+            addView(tools); addView(botTv); addView(pb); addView(bar); addView(langRow)
         }
         root.addView(top); root.addView(bottom)
         setContentView(root)
@@ -208,10 +215,8 @@ class MainActivity : Activity() {
                     idle()
                     if (code == 12 || code == 13) {   // язык не поддерживается / пакет не скачан
                         ensureSpeech(a, true)
-                        botTv.text = if (Build.VERSION.SDK_INT >= 33)
-                            "Скачиваю речевой пакет «${a.name}»… Подождите минуту и повторите."
-                        else
-                            "Нужен речевой пакет «${a.name}»: Настройки → Google → Голосовой ввод → Офлайн-распознавание."
+                        if (Build.VERSION.SDK_INT < 33)
+                            botTv.text = "Нужен речевой пакет «${a.name}»: Настройки → Google → Голосовой ввод → Офлайн-распознавание."
                         return
                     }
                     failCount++
@@ -293,10 +298,11 @@ class MainActivity : Activity() {
         val m = TranslateRemoteModel.Builder(l.ml).build()
         mm.isModelDownloaded(m).addOnSuccessListener { ok ->
             if (!ok) {
-                botTv.text = "Скачиваю язык «${l.name}» для перевода…"
+                val k = "Язык перевода: ${l.name}"
+                taskStart(k)
                 mm.download(m, DownloadConditions.Builder().build())
-                    .addOnSuccessListener { botTv.text = "Язык «${l.name}» скачан ✓" }
-                    .addOnFailureListener { botTv.text = "Не удалось скачать «${l.name}». Нужен интернет." }
+                    .addOnSuccessListener { taskDone(k, "Язык «${l.name}» скачан ✓") }
+                    .addOnFailureListener { taskDone(k, "Не удалось скачать «${l.name}». Нужен интернет.") }
             }
         }
     }
@@ -319,8 +325,20 @@ class MainActivity : Activity() {
                     val pending = s.pendingOnDeviceLanguages.has()
                     val supported = s.supportedOnDeviceLanguages.has()
                     if (!installed && !pending && supported) {
-                        botTv.text = "Скачиваю речевой пакет «${l.name}»…"
-                        try { r.triggerModelDownload(i) } catch (e: Exception) { }
+                        val k = "Речевой пакет: ${l.name}"
+                        taskStart(k)
+                        try {
+                            if (Build.VERSION.SDK_INT >= 34) {
+                                r.triggerModelDownload(i, mainExecutor, object : ModelDownloadListener {
+                                    override fun onProgress(completedPercent: Int) { taskStart(k, completedPercent) }
+                                    override fun onSuccess() { taskDone(k, "Речевой пакет «${l.name}» скачан ✓") }
+                                    override fun onScheduled() { taskStart(k, -1) }
+                                    override fun onError(error: Int) {
+                                        taskDone(k, "Речевой пакет «${l.name}» не скачался (код $error). Онлайн-режим работает и без него.")
+                                    }
+                                })
+                            } else r.triggerModelDownload(i)
+                        } catch (e: Exception) { taskDone(k, "Речевой пакет «${l.name}» скачать не удалось. Онлайн-режим работает и без него.") }
                     }
                 }
                 override fun onError(error: Int) {}
@@ -468,7 +486,7 @@ class MainActivity : Activity() {
     }
 
     private fun downloadApk(url: String) {
-        botTv.text = "Скачиваю обновление… 0%"
+        taskStart("Обновление приложения", 0, 600000)
         thread {
             try {
                 val c = URL(url).openConnection() as HttpURLConnection
@@ -483,14 +501,14 @@ class MainActivity : Activity() {
                             out.write(buf, 0, n); done += n
                             if (total > 0) {
                                 val p = (done * 100 / total).toInt()
-                                if (p != last) { last = p; runOnUiThread { botTv.text = "Скачиваю обновление… $p%" } }
+                                if (p != last) { last = p; runOnUiThread { taskStart("Обновление приложения", p, 600000) } }
                             }
                         }
                     }
                 }
-                runOnUiThread { installApk(f) }
+                runOnUiThread { taskDone("Обновление приложения", "Устанавливаю обновление…"); installApk(f) }
             } catch (e: Exception) {
-                runOnUiThread { botTv.text = "Ошибка загрузки обновления: ${e.message}" }
+                runOnUiThread { taskDone("Обновление приложения", "Ошибка загрузки обновления: ${e.message}") }
             }
         }
     }
@@ -521,16 +539,16 @@ class MainActivity : Activity() {
 
     private fun updateLangs(silent: Boolean) {
         val mm = RemoteModelManager.getInstance()
-        if (!silent) botTv.text = "Обновляю языковые пакеты…"
+        if (!silent) taskStart("Языковые пакеты")
         mm.getDownloadedModels(TranslateRemoteModel::class.java).addOnSuccessListener { set ->
             val all = HashSet<TranslateRemoteModel>(set)
             listOf(src(), dst()).filter { it.ml != TranslateLanguage.ENGLISH }
                 .forEach { all.add(TranslateRemoteModel.Builder(it.ml).build()) }
-            if (all.isEmpty()) { if (!silent) botTv.text = "Языковые пакеты актуальны ✓"; return@addOnSuccessListener }
+            if (all.isEmpty()) { if (!silent) taskDone("Языковые пакеты", "Языковые пакеты актуальны ✓"); return@addOnSuccessListener }
             var left = all.size
             all.forEach { m ->
                 mm.download(m, DownloadConditions.Builder().build()).addOnCompleteListener {
-                    if (--left == 0 && !silent) botTv.text = "Языковые пакеты обновлены ✓ (${all.size})"
+                    if (--left == 0 && !silent) taskDone("Языковые пакеты", "Языковые пакеты обновлены ✓ (${all.size})")
                 }
             }
         }
@@ -586,6 +604,33 @@ class MainActivity : Activity() {
         val a = dlgA; val b = dlgB
         if (resultCode == RESULT_OK && !t.isNullOrBlank() && a != null && b != null) translate(dlgSide, t, a, b)
         else botTv.text = "Речь не распознана. Нажмите микрофон и повторите."
+    }
+
+    // ---------- индикатор загрузок: «Подождите, пожалуйста» + полоса % ----------
+    private val tasks = LinkedHashMap<String, Int>()
+    private val ui = android.os.Handler(android.os.Looper.getMainLooper())
+
+    private fun taskStart(key: String, pct: Int = -1, timeoutMs: Long = 180000) {
+        val first = !tasks.containsKey(key)
+        tasks[key] = pct
+        if (first) ui.postDelayed({
+            if (tasks.containsKey(key))
+                taskDone(key, "$key: загрузка продолжится в фоне. Переводить онлайн можно уже сейчас.")
+        }, timeoutMs)
+        showTasks()
+    }
+
+    private fun taskDone(key: String, msg: String) {
+        tasks.remove(key)
+        if (tasks.isEmpty()) { pb.visibility = View.GONE; botTv.text = msg } else showTasks()
+    }
+
+    private fun showTasks() {
+        botTv.text = tasks.entries.joinToString("\n") { it.key + if (it.value >= 0) " — ${it.value}%" else "…" } +
+            "\n\nПодождите, пожалуйста"
+        pb.visibility = View.VISIBLE
+        val p = tasks.values.firstOrNull { it >= 0 }
+        if (p == null) pb.isIndeterminate = true else { pb.isIndeterminate = false; pb.progress = p }
     }
 
     // ---------- перевод ----------
@@ -651,14 +696,13 @@ class MainActivity : Activity() {
     }
 
     private fun downloadLangs() {
-        val codes = setOf(src().ml, dst().ml)
-        var left = codes.size
-        botTv.text = "Скачиваю языки…"
-        codes.forEach { c ->
+        setOf(src(), dst()).forEach { l ->
+            val k = "Язык перевода: ${l.name}"
+            taskStart(k)
             RemoteModelManager.getInstance()
-                .download(TranslateRemoteModel.Builder(c).build(), DownloadConditions.Builder().build())
-                .addOnSuccessListener { if (--left == 0) botTv.text = "Языки скачаны ✓ Теперь работает без интернета." }
-                .addOnFailureListener { botTv.text = "Ошибка загрузки. Нужен интернет." }
+                .download(TranslateRemoteModel.Builder(l.ml).build(), DownloadConditions.Builder().build())
+                .addOnSuccessListener { taskDone(k, "Языки скачаны ✓ Перевод работает без интернета.") }
+                .addOnFailureListener { taskDone(k, "Ошибка загрузки. Нужен интернет.") }
         }
     }
 
