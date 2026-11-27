@@ -176,9 +176,12 @@ class MainActivity : Activity() {
     }
 
     // ---------- распознавание ----------
-    private fun listen(side: Int) {
+    private var retryLeft = 1
+
+    private fun listen(side: Int, retry: Boolean = false) {
         if (listeningSide == side) { rec?.stopListening(); return }
         if (listeningSide != -1) return
+        if (!retry) retryLeft = 1
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             pendingSide = side
             requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 1); return
@@ -217,6 +220,12 @@ class MainActivity : Activity() {
                         ensureSpeech(a, true)
                         if (Build.VERSION.SDK_INT < 33)
                             botTv.text = "Нужен речевой пакет «${a.name}»: Настройки → Google → Голосовой ввод → Офлайн-распознавание."
+                        return
+                    }
+                    if ((code == 7 || code == 6) && retryLeft > 0) {
+                        retryLeft--
+                        botTv.text = "Слушаю…"
+                        ui.postDelayed({ if (listeningSide == -1) listen(side, true) }, 300)
                         return
                     }
                     failCount++
@@ -310,7 +319,12 @@ class MainActivity : Activity() {
     // 2) офлайн-пакет распознавания речи (Android 13+)
     private fun ensureSpeech(l: Lang, force: Boolean) {
         if (Build.VERSION.SDK_INT < 33) return
-        if (!prepared.add("s:" + l.tag) && !force) return
+        val sp0 = getSharedPreferences("tt", MODE_PRIVATE)
+        val spKey = "sp:" + l.tag
+        if (!force) {
+            if (!prepared.add(spKey)) return
+            if (System.currentTimeMillis() - sp0.getLong(spKey, 0) < 3L * 24 * 3600 * 1000) return
+        }
         try {
             val r = newRecognizer()
             helpers.add(r)
@@ -326,7 +340,8 @@ class MainActivity : Activity() {
                     val supported = s.supportedOnDeviceLanguages.has()
                     if (!installed && !pending && supported) {
                         val k = "Речевой пакет: ${l.name}"
-                        taskStart(k)
+                        sp0.edit().putLong(spKey, System.currentTimeMillis()).apply()
+                        taskStart(k, -1, 60000)
                         try {
                             if (Build.VERSION.SDK_INT >= 34) {
                                 r.triggerModelDownload(i, mainExecutor, object : ModelDownloadListener {
@@ -572,7 +587,7 @@ class MainActivity : Activity() {
                 1 -> updateLangs(false)
                 2 -> { sp.edit().putBoolean("auto", !auto).apply()
                        Toast.makeText(this, if (!auto) "Автообновление включено" else "Автообновление выключено", Toast.LENGTH_SHORT).show() }
-                3 -> { online = !online; Toast.makeText(this, if (online) "Онлайн" else "Офлайн", Toast.LENGTH_SHORT).show() }
+                3 -> toggleMode()
                 4 -> { wizardSeen.clear(); prepared.clear(); ensureLang(src()); ensureLang(dst()); runSetup() }
                 5 -> { val v = !sp.getBoolean("sys", false); sp.edit().putBoolean("sys", v).apply(); failCount = 0
                        Toast.makeText(this, if (v) "Системное окно голосового ввода" else "Встроенное распознавание", Toast.LENGTH_SHORT).show() }
@@ -606,6 +621,12 @@ class MainActivity : Activity() {
         else botTv.text = "Речь не распознана. Нажмите микрофон и повторите."
     }
 
+    private fun toggleMode() {
+        online = !online
+        Toast.makeText(this, if (online) "Онлайн" else "Офлайн", Toast.LENGTH_SHORT).show()
+        if (!online) { ensureSpeech(src(), true); ensureSpeech(dst(), true) }   // для офлайна нужны речевые пакеты
+    }
+
     // ---------- индикатор загрузок: «Подождите, пожалуйста» + полоса % ----------
     private val tasks = LinkedHashMap<String, Int>()
     private val ui = android.os.Handler(android.os.Looper.getMainLooper())
@@ -615,7 +636,7 @@ class MainActivity : Activity() {
         tasks[key] = pct
         if (first) ui.postDelayed({
             if (tasks.containsKey(key))
-                taskDone(key, "$key: загрузка продолжится в фоне. Переводить онлайн можно уже сейчас.")
+                taskDone(key, "$key: загрузка идёт в фоне. Онлайн-режим уже работает, ждать не нужно.")
         }, timeoutMs)
         showTasks()
     }
@@ -674,7 +695,7 @@ class MainActivity : Activity() {
     // ---------- меню, история ----------
     private fun menu(anchor: View) {
         PopupMenu(this, anchor).apply {
-            menu.add(0, 6, -1, "⚙ Настройки и обновления")
+            menu.add(0, 6, 0, "⚙ Настройки и обновления")
             menu.add(0, 1, 0, if (online) "Режим: ОНЛАЙН (нажмите — офлайн)" else "Режим: ОФЛАЙН (нажмите — онлайн)")
             menu.add(0, 2, 1, "История")
             menu.add(0, 3, 2, "Избранное")
@@ -682,7 +703,7 @@ class MainActivity : Activity() {
             menu.add(0, 5, 4, "Мастер настройки")
             setOnMenuItemClickListener {
                 when (it.itemId) {
-                    1 -> { online = !online; Toast.makeText(this@MainActivity, if (online) "Онлайн" else "Офлайн", Toast.LENGTH_SHORT).show() }
+                    1 -> toggleMode()
                     2 -> showHist(false)
                     3 -> showHist(true)
                     4 -> downloadLangs()
