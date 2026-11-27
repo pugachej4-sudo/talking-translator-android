@@ -15,6 +15,8 @@ import android.content.pm.PackageInstaller
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -70,7 +72,10 @@ class MainActivity : Activity() {
     private val DARK = Color.parseColor("#00796B")
     private val LIGHT = Color.parseColor("#B2E5DD")
 
-    private var online = true
+    private var mode = 2                 // 0 — онлайн, 1 — офлайн, 2 — авто
+    private var autoForceOffline = false
+    private val online: Boolean
+        get() = when (mode) { 0 -> true; 1 -> false; else -> hasNet() && !autoForceOffline }
     private var topText = ""
     private var botText = ""
     private var listeningSide = -1
@@ -106,6 +111,7 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        mode = getSharedPreferences("tt", MODE_PRIVATE).getInt("mode", 2)
         val inf = IntentFilter(ACTION_INSTALL)
         if (Build.VERSION.SDK_INT >= 33) registerReceiver(installReceiver, inf, Context.RECEIVER_NOT_EXPORTED)
         else registerReceiver(installReceiver, inf)
@@ -222,6 +228,13 @@ class MainActivity : Activity() {
                             botTv.text = "Нужен речевой пакет «${a.name}»: Настройки → Google → Голосовой ввод → Офлайн-распознавание."
                         return
                     }
+                    if ((code == 1 || code == 2) && mode == 2 && !autoForceOffline) {
+                        autoForceOffline = true
+                        ui.postDelayed({ autoForceOffline = false }, 60000)
+                        botTv.text = "Нет интернета — переключаюсь на офлайн…"
+                        ui.postDelayed({ if (listeningSide == -1) listen(side, true) }, 300)
+                        return
+                    }
                     if ((code == 7 || code == 6) && retryLeft > 0) {
                         retryLeft--
                         botTv.text = "Слушаю…"
@@ -307,11 +320,7 @@ class MainActivity : Activity() {
         val m = TranslateRemoteModel.Builder(l.ml).build()
         mm.isModelDownloaded(m).addOnSuccessListener { ok ->
             if (!ok) {
-                val k = "Язык перевода: ${l.name}"
-                taskStart(k)
-                mm.download(m, DownloadConditions.Builder().build())
-                    .addOnSuccessListener { taskDone(k, "Язык «${l.name}» скачан ✓") }
-                    .addOnFailureListener { taskDone(k, "Не удалось скачать «${l.name}». Нужен интернет.") }
+                downloadModel(l)
             }
         }
     }
@@ -341,7 +350,8 @@ class MainActivity : Activity() {
                     if (!installed && !pending && supported) {
                         val k = "Речевой пакет: ${l.name}"
                         sp0.edit().putLong(spKey, System.currentTimeMillis()).apply()
-                        taskStart(k, -1, 60000)
+                        taskStart(k, -1, 300000)
+                        pollSpeech(r, i, l, k, 75)
                         try {
                             if (Build.VERSION.SDK_INT >= 34) {
                                 r.triggerModelDownload(i, mainExecutor, object : ModelDownloadListener {
@@ -576,21 +586,23 @@ class MainActivity : Activity() {
         val auto = sp.getBoolean("auto", true)
         val items = arrayOf(
             "Обновить приложение (версия ${BuildConfig.VERSION_CODE})",
+            "Языки для офлайна: что скачано / скачать ещё",
             "Обновить языковые пакеты",
             "Автообновление при запуске: " + if (auto) "ВКЛ" else "ВЫКЛ",
-            "Режим: " + if (online) "ОНЛАЙН (переключить на офлайн)" else "ОФЛАЙН (переключить на онлайн)",
-            "Мастер настройки (Google, голоса)",
-            "Распознавание речи: " + if (sp.getBoolean("sys", false)) "СИСТЕМНОЕ ОКНО (переключить на встроенное)" else "ВСТРОЕННОЕ (переключить на системное окно)")
+            "Режим перевода: " + modeName(),
+            "Распознавание речи: " + if (sp.getBoolean("sys", false)) "СИСТЕМНОЕ ОКНО (переключить на встроенное)" else "ВСТРОЕННОЕ (переключить на системное окно)",
+            "Мастер настройки (Google, голоса)")
         AlertDialog.Builder(this).setTitle("Настройки").setItems(items) { _, i ->
             when (i) {
                 0 -> checkUpdate(false)
-                1 -> updateLangs(false)
-                2 -> { sp.edit().putBoolean("auto", !auto).apply()
+                1 -> showLangManager()
+                2 -> updateLangs(false)
+                3 -> { sp.edit().putBoolean("auto", !auto).apply()
                        Toast.makeText(this, if (!auto) "Автообновление включено" else "Автообновление выключено", Toast.LENGTH_SHORT).show() }
-                3 -> toggleMode()
-                4 -> { wizardSeen.clear(); prepared.clear(); ensureLang(src()); ensureLang(dst()); runSetup() }
+                4 -> showModeDialog()
                 5 -> { val v = !sp.getBoolean("sys", false); sp.edit().putBoolean("sys", v).apply(); failCount = 0
                        Toast.makeText(this, if (v) "Системное окно голосового ввода" else "Встроенное распознавание", Toast.LENGTH_SHORT).show() }
+                6 -> { wizardSeen.clear(); prepared.clear(); ensureLang(src()); ensureLang(dst()); runSetup() }
             }
         }.show()
     }
@@ -604,7 +616,7 @@ class MainActivity : Activity() {
     private fun errText(c: Int) = when (c) {
         7 -> "Не расслышал. Нажмите микрофон и говорите сразу, ближе к телефону."
         6 -> "Не услышал речь. Нажмите микрофон и начните говорить."
-        1, 2 -> "Проблема с сетью. Проверьте интернет."
+        1, 2 -> if (!online) "Офлайн: для этого языка не установлен речевой пакет. Откройте ⋮ → ⚙ → Языки для офлайна и скачайте его." else "Проблема с сетью. Проверьте интернет."
         3 -> "Ошибка записи звука."
         8 -> "Распознаватель занят, повторите."
         9 -> "Нет разрешения на микрофон."
@@ -621,37 +633,213 @@ class MainActivity : Activity() {
         else botTv.text = "Речь не распознана. Нажмите микрофон и повторите."
     }
 
-    private fun toggleMode() {
-        online = !online
-        Toast.makeText(this, if (online) "Онлайн" else "Офлайн", Toast.LENGTH_SHORT).show()
-        if (!online) { ensureSpeech(src(), true); ensureSpeech(dst(), true) }   // для офлайна нужны речевые пакеты
+    private fun hasNet(): Boolean {
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val n = cm.activeNetwork ?: return false
+        val c = cm.getNetworkCapabilities(n) ?: return false
+        return c.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+            c.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
     }
 
-    // ---------- индикатор загрузок: «Подождите, пожалуйста» + полоса % ----------
+    private fun modeName() = when (mode) {
+        0 -> "ОНЛАЙН"
+        1 -> "ОФЛАЙН"
+        else -> "АВТО (сейчас " + (if (online) "онлайн" else "офлайн") + ")"
+    }
+
+    private fun showModeDialog() {
+        val items = arrayOf("Онлайн", "Офлайн", "Авто: онлайн, а если нет сети — офлайн")
+        AlertDialog.Builder(this).setTitle("Режим перевода")
+            .setSingleChoiceItems(items, mode) { d, i -> setMode(i); d.dismiss() }
+            .setNegativeButton("Закрыть", null).show()
+    }
+
+    private fun setMode(m: Int) {
+        mode = m; autoForceOffline = false
+        getSharedPreferences("tt", MODE_PRIVATE).edit().putInt("mode", m).apply()
+        Toast.makeText(this, "Режим: " + modeName(), Toast.LENGTH_SHORT).show()
+        if (m != 0) offlineCheck()   // офлайн (и запасной офлайн в авто-режиме) должен быть готов
+    }
+
+    // ---------- индикатор загрузок: «Подождите, пожалуйста» + полоса + «N из M» ----------
     private val tasks = LinkedHashMap<String, Int>()
     private val ui = android.os.Handler(android.os.Looper.getMainLooper())
+    private var totalTasks = 0
+    private var doneTasks = 0
+    private var startMs = 0L
+    private var ticking = false
+    private val tick: Runnable = object : Runnable {
+        override fun run() {
+            if (tasks.isNotEmpty()) { showTasks(); ui.postDelayed(this, 1000) } else ticking = false
+        }
+    }
 
     private fun taskStart(key: String, pct: Int = -1, timeoutMs: Long = 180000) {
-        val first = !tasks.containsKey(key)
+        if (!tasks.containsKey(key)) {
+            if (tasks.isEmpty()) { totalTasks = 0; doneTasks = 0; startMs = System.currentTimeMillis() }
+            totalTasks++
+            ui.postDelayed({
+                if (tasks.containsKey(key))
+                    taskDone(key, "$key: загрузка идёт в фоне. Онлайн-режим уже работает, ждать не нужно.")
+            }, timeoutMs)
+        }
         tasks[key] = pct
-        if (first) ui.postDelayed({
-            if (tasks.containsKey(key))
-                taskDone(key, "$key: загрузка идёт в фоне. Онлайн-режим уже работает, ждать не нужно.")
-        }, timeoutMs)
         showTasks()
+        if (!ticking) { ticking = true; ui.postDelayed(tick, 1000) }
     }
 
     private fun taskDone(key: String, msg: String) {
-        tasks.remove(key)
+        if (tasks.remove(key) != null) doneTasks++
         if (tasks.isEmpty()) { pb.visibility = View.GONE; botTv.text = msg } else showTasks()
     }
 
     private fun showTasks() {
-        botTv.text = tasks.entries.joinToString("\n") { it.key + if (it.value >= 0) " — ${it.value}%" else "…" } +
-            "\n\nПодождите, пожалуйста"
+        val sec = ((System.currentTimeMillis() - startMs) / 1000).toInt()
+        val lines = tasks.entries.joinToString("\n") { it.key + if (it.value >= 0) " — ${it.value}%" else "…" }
+        botTv.text = lines + "\n\nЗагружено $doneTasks из $totalTasks · прошло %d:%02d\nПодождите, пожалуйста".format(sec / 60, sec % 60)
         pb.visibility = View.VISIBLE
-        val p = tasks.values.firstOrNull { it >= 0 }
-        if (p == null) pb.isIndeterminate = true else { pb.isIndeterminate = false; pb.progress = p }
+        val partial = tasks.values.filter { it >= 0 }.sum() / 100.0
+        if (totalTasks <= 1 && partial == 0.0) pb.isIndeterminate = true
+        else {
+            pb.isIndeterminate = false
+            pb.progress = (((doneTasks + partial) / totalTasks) * 100).toInt().coerceIn(0, 100)
+        }
+    }
+
+    // ---------- менеджер языков для офлайна ----------
+    private class Status(val tr: Boolean, val sp: Boolean?, val tts: Boolean)
+
+    private fun List<String>.hasLang(l: Lang) =
+        any { it.equals(l.tag, true) || it.substringBefore('-').equals(l.tag.substringBefore('-'), true) }
+
+    private fun ttsOffline(l: Lang): Boolean {
+        val t = tts ?: return false
+        if (!ttsReady) return false
+        val loc = Locale.forLanguageTag(l.tag)
+        if (t.isLanguageAvailable(loc) < TextToSpeech.LANG_AVAILABLE) return false
+        return t.voices?.any { it.locale.language == loc.language && !it.isNetworkConnectionRequired } ?: true
+    }
+
+    private fun downloadModel(l: Lang) {
+        val k = "Перевод: ${l.name}"
+        taskStart(k)
+        RemoteModelManager.getInstance()
+            .download(TranslateRemoteModel.Builder(l.ml).build(), DownloadConditions.Builder().build())
+            .addOnSuccessListener { taskDone(k, "Перевод «${l.name}» скачан ✓") }
+            .addOnFailureListener { taskDone(k, "Не удалось скачать перевод «${l.name}». Нужен интернет.") }
+    }
+
+    private fun pollSpeech(r: SpeechRecognizer, i: Intent, l: Lang, k: String, left: Int) {
+        if (Build.VERSION.SDK_INT < 33 || left <= 0) return
+        ui.postDelayed({
+            if (!tasks.containsKey(k)) return@postDelayed
+            try {
+                r.checkRecognitionSupport(i, mainExecutor, object : RecognitionSupportCallback {
+                    override fun onSupportResult(s: RecognitionSupport) {
+                        if (s.installedOnDeviceLanguages.hasLang(l)) taskDone(k, "Речевой пакет «${l.name}» скачан ✓")
+                        else pollSpeech(r, i, l, k, left - 1)
+                    }
+                    override fun onError(error: Int) { pollSpeech(r, i, l, k, left - 1) }
+                })
+            } catch (e: Exception) { }
+        }, 4000)
+    }
+
+    // что реально скачано: перевод (ML Kit), речь (Google), голос (TTS)
+    private fun collectStatus(cb: (Map<String, Status>) -> Unit) {
+        RemoteModelManager.getInstance().getDownloadedModels(TranslateRemoteModel::class.java)
+            .addOnCompleteListener { task ->
+                val codes: Set<String> = if (task.isSuccessful) task.result.map { it.language }.toSet() else emptySet()
+                fun finish(installed: List<String>?) {
+                    val m = LinkedHashMap<String, Status>()
+                    langs.forEach { l ->
+                        m[l.tag] = Status(l.ml == TranslateLanguage.ENGLISH || l.ml in codes, installed?.hasLang(l), ttsOffline(l))
+                    }
+                    cb(m)
+                }
+                if (Build.VERSION.SDK_INT >= 33) {
+                    try {
+                        val r = newRecognizer(); helpers.add(r)
+                        val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                            .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                            .putExtra(RecognizerIntent.EXTRA_LANGUAGE, src().tag)
+                        r.checkRecognitionSupport(i, mainExecutor, object : RecognitionSupportCallback {
+                            override fun onSupportResult(s: RecognitionSupport) { finish(s.installedOnDeviceLanguages) }
+                            override fun onError(error: Int) { finish(null) }
+                        })
+                    } catch (e: Exception) { finish(null) }
+                } else finish(null)
+            }
+    }
+
+    private fun showLangManager() {
+        botTv.text = "Проверяю языки…"
+        collectStatus { st ->
+            botTv.text = if (botText.isNotEmpty()) botText else "Нажмите микрофон"
+            fun mark(b: Boolean?) = when (b) { true -> "✓"; false -> "✗"; null -> "?" }
+            val labels = langs.map { l ->
+                val s = st[l.tag]!!
+                "${l.name}\n   перевод ${mark(s.tr)}   речь ${mark(s.sp)}   голос ${mark(s.tts)}"
+            }.toTypedArray()
+            val dlg = AlertDialog.Builder(this)
+                .setTitle("Языки для офлайна (✓ есть, ✗ нет, ? неизвестно)")
+                .setMultiChoiceItems(labels, BooleanArray(langs.size), null)
+                .setPositiveButton("Скачать выбранные", null)
+                .setNeutralButton("Выбрать недостающие", null)
+                .setNegativeButton("Закрыть", null).create()
+            dlg.show()
+            dlg.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener {
+                langs.forEachIndexed { i, l ->
+                    val s = st[l.tag]!!
+                    if (!s.tr || s.sp == false || !s.tts) dlg.listView.setItemChecked(i, true)
+                }
+            }
+            dlg.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val pos = dlg.listView.checkedItemPositions
+                val sel = langs.filterIndexed { i, _ -> pos.get(i) }
+                if (sel.isEmpty()) Toast.makeText(this, "Отметьте языки галочками", Toast.LENGTH_SHORT).show()
+                else { dlg.dismiss(); downloadSelected(sel, st) }
+            }
+        }
+    }
+
+    private fun downloadSelected(sel: List<Lang>, st: Map<String, Status>) {
+        sel.forEach { l ->
+            if (l.ml != TranslateLanguage.ENGLISH) downloadModel(l)
+            ensureSpeech(l, true)
+        }
+        val noVoice = sel.filter { st[it.tag]?.tts == false }
+        if (noVoice.isNotEmpty()) {
+            AlertDialog.Builder(this).setTitle("Голоса для озвучки")
+                .setMessage("Для офлайн-озвучки нужно скачать голоса: ${noVoice.joinToString { it.name }}. Открыть список голосов? Нажмите на язык и значок загрузки.")
+                .setPositiveButton("Да, открыть") { _, _ ->
+                    try { startActivity(Intent(TextToSpeech.Engine.ACTION_INSTALL_TTS_DATA)) } catch (e: Exception) { }
+                }
+                .setNegativeButton("Позже", null).show()
+        }
+    }
+
+    private fun offlineCheck() {
+        collectStatus { st ->
+            val miss = listOf(src(), dst()).distinct().filter { l ->
+                val s = st[l.tag]!!; !s.tr || s.sp == false || !s.tts
+            }
+            if (miss.isEmpty()) {
+                Toast.makeText(this, "Офлайн готов ✓", Toast.LENGTH_SHORT).show()
+                return@collectStatus
+            }
+            val txt = miss.joinToString("\n") { l ->
+                val s = st[l.tag]!!
+                "• ${l.name}: " + listOfNotNull(
+                    if (!s.tr) "перевод" else null,
+                    if (s.sp == false) "распознавание речи" else null,
+                    if (!s.tts) "голос" else null).joinToString(", ")
+            }
+            AlertDialog.Builder(this).setTitle("Офлайн пока не готов")
+                .setMessage("Не хватает:\n$txt\n\nСкачать сейчас? Нужен интернет.")
+                .setPositiveButton("Да, скачать") { _, _ -> downloadSelected(miss, st) }
+                .setNegativeButton("Позже", null).show()
+        }
     }
 
     // ---------- перевод ----------
@@ -696,34 +884,23 @@ class MainActivity : Activity() {
     private fun menu(anchor: View) {
         PopupMenu(this, anchor).apply {
             menu.add(0, 6, 0, "⚙ Настройки и обновления")
-            menu.add(0, 1, 0, if (online) "Режим: ОНЛАЙН (нажмите — офлайн)" else "Режим: ОФЛАЙН (нажмите — онлайн)")
+            menu.add(0, 1, 0, "Режим перевода: " + modeName())
             menu.add(0, 2, 1, "История")
             menu.add(0, 3, 2, "Избранное")
-            menu.add(0, 4, 3, "Скачать языки для офлайна")
+            menu.add(0, 4, 3, "Языки для офлайна (скачать / проверить)")
             menu.add(0, 5, 4, "Мастер настройки")
             setOnMenuItemClickListener {
                 when (it.itemId) {
-                    1 -> toggleMode()
+                    1 -> showModeDialog()
                     2 -> showHist(false)
                     3 -> showHist(true)
-                    4 -> downloadLangs()
+                    4 -> showLangManager()
                     6 -> showSettings()
                     5 -> { wizardSeen.clear(); prepared.clear(); ensureLang(src()); ensureLang(dst()); runSetup() }
                 }
                 true
             }
             show()
-        }
-    }
-
-    private fun downloadLangs() {
-        setOf(src(), dst()).forEach { l ->
-            val k = "Язык перевода: ${l.name}"
-            taskStart(k)
-            RemoteModelManager.getInstance()
-                .download(TranslateRemoteModel.Builder(l.ml).build(), DownloadConditions.Builder().build())
-                .addOnSuccessListener { taskDone(k, "Языки скачаны ✓ Перевод работает без интернета.") }
-                .addOnFailureListener { taskDone(k, "Ошибка загрузки. Нужен интернет.") }
         }
     }
 
