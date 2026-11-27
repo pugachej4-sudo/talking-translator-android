@@ -3,11 +3,15 @@ package com.talk.translator
 import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
+import android.app.PendingIntent
+import android.content.BroadcastReceiver
 import android.content.ClipData
 import android.content.ComponentName
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
+import android.content.pm.PackageInstaller
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
@@ -34,9 +38,13 @@ import com.google.mlkit.nl.translate.Translation
 import com.google.mlkit.nl.translate.TranslatorOptions
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlin.concurrent.thread
 
 class MainActivity : Activity() {
     class Lang(val name: String, val ml: String, val tag: String)
@@ -96,6 +104,9 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val inf = IntentFilter(ACTION_INSTALL)
+        if (Build.VERSION.SDK_INT >= 33) registerReceiver(installReceiver, inf, Context.RECEIVER_NOT_EXPORTED)
+        else registerReceiver(installReceiver, inf)
         initTts("com.google.android.tts")
 
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; fitsSystemWindows = true; setBackgroundColor(Color.WHITE) }
@@ -154,7 +165,7 @@ class MainActivity : Activity() {
         }
         root.addView(top); root.addView(bottom)
         setContentView(root)
-        root.post { runSetup() }
+        root.post { runSetup(); autoMaintenance() }
     }
 
     // ---------- распознавание ----------
@@ -371,10 +382,166 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         val rw = resumeWizard; resumeWizard = false
+        pendingApk?.let { f ->
+            if (Build.VERSION.SDK_INT < 26 || packageManager.canRequestPackageInstalls()) { pendingApk = null; installApk(f) }
+        }
         if (ttsEngine != GTTS && ttsRetry < 3 && installed(GTTS)) {
             ttsRetry++; ttsReady = false; tts?.shutdown(); initTts(GTTS); return
         }
         if (rw) runSetup()
+    }
+
+    // ---------- обновления приложения и языковых пакетов ----------
+    private val REPO = "pugachej4-sudo/talking-translator-android"
+    private val ACTION_INSTALL = "com.talk.translator.INSTALL_RESULT"
+    private var pendingApk: File? = null
+
+    private val installReceiver = object : BroadcastReceiver() {
+        override fun onReceive(c: Context, i: Intent) {
+            when (i.getIntExtra(PackageInstaller.EXTRA_STATUS, -1)) {
+                PackageInstaller.STATUS_PENDING_USER_ACTION -> {
+                    @Suppress("DEPRECATION")
+                    val conf = i.getParcelableExtra<Intent>(Intent.EXTRA_INTENT)
+                    conf?.let { it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK); startActivity(it) }
+                }
+                PackageInstaller.STATUS_SUCCESS -> botTv.text = "Обновление установлено ✓"
+                else -> botTv.text = "Не удалось установить обновление: " +
+                    i.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE) +
+                    ". Если это ошибка подписи — удалите старую версию и поставьте новую вручную."
+            }
+        }
+    }
+
+    private fun autoMaintenance() {
+        val sp = getSharedPreferences("tt", MODE_PRIVATE)
+        if (!sp.getBoolean("auto", true)) return
+        checkUpdate(true)
+        if (System.currentTimeMillis() - sp.getLong("langUpd", 0) > 7L * 24 * 3600 * 1000) updateLangs(true)
+    }
+
+    private fun checkUpdate(silent: Boolean) {
+        if (!silent) botTv.text = "Проверяю обновления…"
+        thread {
+            try {
+                val c = URL("https://api.github.com/repos/$REPO/releases/latest").openConnection() as HttpURLConnection
+                c.setRequestProperty("Accept", "application/vnd.github+json")
+                c.setRequestProperty("User-Agent", "TalkingTranslator")
+                c.connectTimeout = 10000; c.readTimeout = 10000
+                val j = JSONObject(c.inputStream.bufferedReader().readText())
+                val remote = j.getString("tag_name").substringAfterLast('-').toIntOrNull() ?: 0
+                var url = ""
+                val assets = j.getJSONArray("assets")
+                for (k in 0 until assets.length()) {
+                    val a = assets.getJSONObject(k)
+                    if (a.getString("name").endsWith(".apk")) url = a.getString("browser_download_url")
+                }
+                runOnUiThread {
+                    if (remote > BuildConfig.VERSION_CODE && url.isNotEmpty()) askUpdate(remote, url)
+                    else if (!silent) botTv.text = "У вас последняя версия (${BuildConfig.VERSION_CODE}) ✓"
+                }
+            } catch (e: Exception) {
+                if (!silent) runOnUiThread { botTv.text = "Не удалось проверить обновления. Нужен интернет." }
+            }
+        }
+    }
+
+    private fun askUpdate(remote: Int, url: String) {
+        AlertDialog.Builder(this).setTitle("Доступно обновление")
+            .setMessage("Новая версия $remote (у вас ${BuildConfig.VERSION_CODE}). Скачать и установить?")
+            .setPositiveButton("Да, обновить") { _, _ -> downloadApk(url) }
+            .setNegativeButton("Позже", null).show()
+    }
+
+    private fun downloadApk(url: String) {
+        botTv.text = "Скачиваю обновление… 0%"
+        thread {
+            try {
+                val c = URL(url).openConnection() as HttpURLConnection
+                c.connectTimeout = 15000; c.readTimeout = 30000
+                val total = c.contentLengthLong
+                val f = File(cacheDir, "update.apk")
+                c.inputStream.use { inp ->
+                    f.outputStream().use { out ->
+                        val buf = ByteArray(65536); var done = 0L; var last = -1
+                        while (true) {
+                            val n = inp.read(buf); if (n < 0) break
+                            out.write(buf, 0, n); done += n
+                            if (total > 0) {
+                                val p = (done * 100 / total).toInt()
+                                if (p != last) { last = p; runOnUiThread { botTv.text = "Скачиваю обновление… $p%" } }
+                            }
+                        }
+                    }
+                }
+                runOnUiThread { installApk(f) }
+            } catch (e: Exception) {
+                runOnUiThread { botTv.text = "Ошибка загрузки обновления: ${e.message}" }
+            }
+        }
+    }
+
+    private fun installApk(f: File) {
+        if (Build.VERSION.SDK_INT >= 26 && !packageManager.canRequestPackageInstalls()) {
+            pendingApk = f
+            botTv.text = "Разрешите приложению устанавливать обновления и вернитесь назад."
+            startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName")))
+            return
+        }
+        try {
+            val pi = packageManager.packageInstaller
+            val params = PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL)
+            if (Build.VERSION.SDK_INT >= 31) params.setRequireUserAction(PackageInstaller.SessionParams.USER_ACTION_NOT_REQUIRED)
+            val id = pi.createSession(params)
+            pi.openSession(id).use { sess ->
+                f.inputStream().use { inp ->
+                    sess.openWrite("app.apk", 0, f.length()).use { out -> inp.copyTo(out); sess.fsync(out) }
+                }
+                val flags = PendingIntent.FLAG_UPDATE_CURRENT or (if (Build.VERSION.SDK_INT >= 31) PendingIntent.FLAG_MUTABLE else 0)
+                val pend = PendingIntent.getBroadcast(this, id, Intent(ACTION_INSTALL).setPackage(packageName), flags)
+                sess.commit(pend.intentSender)
+            }
+            botTv.text = "Устанавливаю обновление…"
+        } catch (e: Exception) { botTv.text = "Ошибка установки: ${e.message}" }
+    }
+
+    private fun updateLangs(silent: Boolean) {
+        val mm = RemoteModelManager.getInstance()
+        if (!silent) botTv.text = "Обновляю языковые пакеты…"
+        mm.getDownloadedModels(TranslateRemoteModel::class.java).addOnSuccessListener { set ->
+            val all = HashSet<TranslateRemoteModel>(set)
+            listOf(src(), dst()).filter { it.ml != TranslateLanguage.ENGLISH }
+                .forEach { all.add(TranslateRemoteModel.Builder(it.ml).build()) }
+            if (all.isEmpty()) { if (!silent) botTv.text = "Языковые пакеты актуальны ✓"; return@addOnSuccessListener }
+            var left = all.size
+            all.forEach { m ->
+                mm.download(m, DownloadConditions.Builder().build()).addOnCompleteListener {
+                    if (--left == 0 && !silent) botTv.text = "Языковые пакеты обновлены ✓ (${all.size})"
+                }
+            }
+        }
+        prepared.clear(); ensureSpeech(src(), true); ensureSpeech(dst(), true)
+        getSharedPreferences("tt", MODE_PRIVATE).edit().putLong("langUpd", System.currentTimeMillis()).apply()
+    }
+
+    private fun showSettings() {
+        val sp = getSharedPreferences("tt", MODE_PRIVATE)
+        val auto = sp.getBoolean("auto", true)
+        val items = arrayOf(
+            "Обновить приложение (версия ${BuildConfig.VERSION_CODE})",
+            "Обновить языковые пакеты",
+            "Автообновление при запуске: " + if (auto) "ВКЛ" else "ВЫКЛ",
+            "Режим: " + if (online) "ОНЛАЙН (переключить на офлайн)" else "ОФЛАЙН (переключить на онлайн)",
+            "Мастер настройки (Google, голоса)")
+        AlertDialog.Builder(this).setTitle("Настройки").setItems(items) { _, i ->
+            when (i) {
+                0 -> checkUpdate(false)
+                1 -> updateLangs(false)
+                2 -> { sp.edit().putBoolean("auto", !auto).apply()
+                       Toast.makeText(this, if (!auto) "Автообновление включено" else "Автообновление выключено", Toast.LENGTH_SHORT).show() }
+                3 -> { online = !online; Toast.makeText(this, if (online) "Онлайн" else "Офлайн", Toast.LENGTH_SHORT).show() }
+                4 -> { wizardSeen.clear(); prepared.clear(); ensureLang(src()); ensureLang(dst()); runSetup() }
+            }
+        }.show()
     }
 
     // ---------- перевод ----------
@@ -418,6 +585,7 @@ class MainActivity : Activity() {
     // ---------- меню, история ----------
     private fun menu(anchor: View) {
         PopupMenu(this, anchor).apply {
+            menu.add(0, 6, -1, "⚙ Настройки и обновления")
             menu.add(0, 1, 0, if (online) "Режим: ОНЛАЙН (нажмите — офлайн)" else "Режим: ОФЛАЙН (нажмите — онлайн)")
             menu.add(0, 2, 1, "История")
             menu.add(0, 3, 2, "Избранное")
@@ -429,6 +597,7 @@ class MainActivity : Activity() {
                     2 -> showHist(false)
                     3 -> showHist(true)
                     4 -> downloadLangs()
+                    6 -> showSettings()
                     5 -> { wizardSeen.clear(); prepared.clear(); ensureLang(src()); ensureLang(dst()); runSetup() }
                 }
                 true
@@ -489,5 +658,5 @@ class MainActivity : Activity() {
         Toast.makeText(this, "Скопировано", Toast.LENGTH_SHORT).show()
     }
 
-    override fun onDestroy() { helpers.forEach { it.destroy() }; rec?.destroy(); tts?.shutdown(); super.onDestroy() }
+    override fun onDestroy() { try { unregisterReceiver(installReceiver) } catch (e: Exception) { }; helpers.forEach { it.destroy() }; rec?.destroy(); tts?.shutdown(); super.onDestroy() }
 }
