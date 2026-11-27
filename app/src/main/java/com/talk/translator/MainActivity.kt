@@ -181,6 +181,16 @@ class MainActivity : Activity() {
         }
         val a = if (side == 0) src() else dst()
         val b = if (side == 0) dst() else src()
+        if (getSharedPreferences("tt", MODE_PRIVATE).getBoolean("sys", false)) {
+            dlgSide = side; dlgA = a; dlgB = b
+            val di = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                .putExtra(RecognizerIntent.EXTRA_LANGUAGE, a.tag)
+                .putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, !online)
+                .putExtra(RecognizerIntent.EXTRA_PROMPT, "Говорите: ${a.name}")
+            try { startActivityForResult(di, 3) } catch (e: Exception) { botTv.text = "Нет системного голосового ввода." }
+            return
+        }
         rec?.destroy()
         rec = newRecognizer().apply {
             setRecognitionListener(object : RecognitionListener {
@@ -204,10 +214,15 @@ class MainActivity : Activity() {
                             "Нужен речевой пакет «${a.name}»: Настройки → Google → Голосовой ввод → Офлайн-распознавание."
                         return
                     }
-                    botTv.text = "Ошибка распознавания ($code). Для офлайна скачайте речевой пакет: Настройки телефона → Google → Голосовой ввод → Офлайн-распознавание."
+                    failCount++
+                    val sp = getSharedPreferences("tt", MODE_PRIVATE)
+                    if (failCount >= 2 && !sp.getBoolean("sys", false)) {
+                        sp.edit().putBoolean("sys", true).apply()
+                        botTv.text = "Встроенное распознавание не сработало ($code). Включил системное окно голосового ввода — нажмите микрофон ещё раз."
+                    } else botTv.text = errText(code)
                 }
                 override fun onResults(r: Bundle?) {
-                    idle()
+                    idle(); failCount = 0
                     val t = r?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
                     if (t.isNullOrBlank()) { botTv.text = "Речь не распознана"; return }
                     translate(side, t, a, b)
@@ -531,7 +546,8 @@ class MainActivity : Activity() {
             "Обновить языковые пакеты",
             "Автообновление при запуске: " + if (auto) "ВКЛ" else "ВЫКЛ",
             "Режим: " + if (online) "ОНЛАЙН (переключить на офлайн)" else "ОФЛАЙН (переключить на онлайн)",
-            "Мастер настройки (Google, голоса)")
+            "Мастер настройки (Google, голоса)",
+            "Распознавание речи: " + if (sp.getBoolean("sys", false)) "СИСТЕМНОЕ ОКНО (переключить на встроенное)" else "ВСТРОЕННОЕ (переключить на системное окно)")
         AlertDialog.Builder(this).setTitle("Настройки").setItems(items) { _, i ->
             when (i) {
                 0 -> checkUpdate(false)
@@ -540,8 +556,36 @@ class MainActivity : Activity() {
                        Toast.makeText(this, if (!auto) "Автообновление включено" else "Автообновление выключено", Toast.LENGTH_SHORT).show() }
                 3 -> { online = !online; Toast.makeText(this, if (online) "Онлайн" else "Офлайн", Toast.LENGTH_SHORT).show() }
                 4 -> { wizardSeen.clear(); prepared.clear(); ensureLang(src()); ensureLang(dst()); runSetup() }
+                5 -> { val v = !sp.getBoolean("sys", false); sp.edit().putBoolean("sys", v).apply(); failCount = 0
+                       Toast.makeText(this, if (v) "Системное окно голосового ввода" else "Встроенное распознавание", Toast.LENGTH_SHORT).show() }
             }
         }.show()
+    }
+
+    // ---------- системное окно голосового ввода (запасной вариант) ----------
+    private var failCount = 0
+    private var dlgSide = 0
+    private var dlgA: Lang? = null
+    private var dlgB: Lang? = null
+
+    private fun errText(c: Int) = when (c) {
+        7 -> "Не расслышал. Нажмите микрофон и говорите сразу, ближе к телефону."
+        6 -> "Не услышал речь. Нажмите микрофон и начните говорить."
+        1, 2 -> "Проблема с сетью. Проверьте интернет."
+        3 -> "Ошибка записи звука."
+        8 -> "Распознаватель занят, повторите."
+        9 -> "Нет разрешения на микрофон."
+        else -> "Ошибка распознавания ($c)."
+    }
+
+    @Suppress("DEPRECATION")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != 3) return
+        val t = data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)?.firstOrNull()
+        val a = dlgA; val b = dlgB
+        if (resultCode == RESULT_OK && !t.isNullOrBlank() && a != null && b != null) translate(dlgSide, t, a, b)
+        else botTv.text = "Речь не распознана. Нажмите микрофон и повторите."
     }
 
     // ---------- перевод ----------
