@@ -12,6 +12,7 @@ android {
         targetSdk = 34
         versionCode = verCode
         versionName = "1.0.$verCode"
+        ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
     }
     signingConfigs {
         create("fixed") {
@@ -33,4 +34,6 @@ android {
 }
 dependencies {
     implementation("com.google.mlkit:translate:17.0.3")
+    implementation("net.java.dev.jna:jna:5.13.0@aar")
+    implementation("com.alphacephei:vosk-android:0.3.47")
 }
