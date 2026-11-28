@@ -420,9 +420,16 @@ class MainActivity : Activity() {
         tts = if (engine != null) TextToSpeech(this, cb, engine) else TextToSpeech(this, cb)
     }
 
+    private fun note(msg: String) { Toast.makeText(this, msg, Toast.LENGTH_LONG).show() }
+
     private fun systemSpeak(text: String, l: Lang) {
-        val t = tts ?: return
-        t.language = Locale.forLanguageTag(l.tag)
+        val t = tts
+        if (t == null || !ttsReady) { note("Системный синтезатор ещё не готов. Подождите секунду и повторите."); return }
+        val r = t.setLanguage(Locale.forLanguageTag(l.tag))
+        if (r == TextToSpeech.LANG_MISSING_DATA || r == TextToSpeech.LANG_NOT_SUPPORTED) {
+            note("Системный синтезатор не умеет говорить на языке «${l.name}» (нет голоса). Выберите нейросетевой голос: ⋮ → Озвучка.")
+            return
+        }
         t.speak(text, TextToSpeech.QUEUE_FLUSH, null, "u")
     }
 
@@ -430,7 +437,16 @@ class MainActivity : Activity() {
         if (text.isBlank()) return
         val n = neural
         val v = selectedVoice(l)
-        if (prefs.getString("tts", "neural") == "neural" && n != null && v != null && voiceReady(v)) {
+        val wantNeural = prefs.getString("tts", "neural") == "neural"
+        if (wantNeural && v != null) {
+            if (n == null) {
+                note("Нейроголоса недоступны в этой сборке — использую системный синтезатор.")
+                systemSpeak(text, l); return
+            }
+            if (!voiceReady(v)) {
+                note("Голос «${v.title}» не скачан — использую системный синтезатор. Скачать: ⋮ → Озвучка → Выбрать голос.")
+                systemSpeak(text, l); return
+            }
             thread {
                 try {
                     synchronized(neuralLock) {
@@ -444,7 +460,9 @@ class MainActivity : Activity() {
                 } catch (e: Throwable) {
                     loadedModel = ""
                     runOnUiThread {
-                        Toast.makeText(this, "Нейроголос не сработал (${e.message}). Использую системный.", Toast.LENGTH_LONG).show()
+                        AlertDialog.Builder(this).setTitle("Нейроголос не сработал")
+                            .setMessage("${e.javaClass.simpleName}: ${e.message}\n\nПока используется системный синтезатор. Пришлите этот текст разработчику.")
+                            .setPositiveButton("OK", null).show()
                         systemSpeak(text, l)
                     }
                 }
@@ -506,12 +524,33 @@ class MainActivity : Activity() {
 
     private fun sample(l: Lang) { speak(sampleText[l.tag.substringBefore('-')] ?: "Test", l) }
 
+    private fun sampleCurrent() {
+        val cands = listOf(dst(), src()).distinct().filter { selectedVoice(it) != null }
+        val l = cands.firstOrNull { c -> selectedVoice(c)?.let { voiceReady(it) } == true } ?: cands.firstOrNull()
+        if (l == null) { note("Для выбранных языков нет нейросетевых голосов. Выберите голос: ⋮ → Озвучка → Выбрать голос."); return }
+        sample(l)
+    }
+
+    private fun showDiag() {
+        val am = getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
+        val vol = am.getStreamVolume(android.media.AudioManager.STREAM_MUSIC)
+        val mx = am.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC)
+        val ready = voices.values.flatten().filter { voiceReady(it) }.joinToString { it.title }
+        val msg = "Нейроголоса в этой сборке: " + (if (neural != null) "да" else "НЕТ") + "\n" +
+            "Тип озвучки: " + (if (prefs.getString("tts", "neural") == "neural") "нейросетевой" else "системный") + "\n" +
+            "Скачанные голоса: " + (if (ready.isEmpty()) "нет" else ready) + "\n" +
+            "Системный синтезатор: " + (if (ttsReady) "готов" else "не готов") + (ttsEngine?.let { " ($it)" } ?: " (по умолчанию)") + "\n" +
+            "Громкость мультимедиа: $vol из $mx" + (if (vol == 0) " — ВЫКЛЮЧЕНА!" else "")
+        AlertDialog.Builder(this).setTitle("Проверка озвучки").setMessage(msg).setPositiveButton("OK", null).show()
+    }
+
     private fun showVoiceDialog() {
         val neuralOn = prefs.getString("tts", "neural") == "neural"
         val items = arrayOf(
             "Тип озвучки: " + if (neuralOn) "НЕЙРОСЕТЕВОЙ ГОЛОС, офлайн (переключить на системный)" else "СИСТЕМНЫЙ (переключить на нейросетевой)",
             "Выбрать голос…",
-            "Прослушать текущий голос (${dst().name})")
+            "Прослушать текущий голос",
+            "Проверка озвучки (диагностика)")
         AlertDialog.Builder(this)
             .setTitle("Озвучка" + if (neural == null) " (нейроголоса недоступны в этой сборке)" else "")
             .setItems(items) { _, i ->
@@ -520,7 +559,8 @@ class MainActivity : Activity() {
                            Toast.makeText(this, if (neuralOn) "Системная озвучка" else "Нейросетевой голос", Toast.LENGTH_SHORT).show()
                            wizardSeen.clear(); runSetup() }
                     1 -> pickVoiceLang()
-                    2 -> sample(dst())
+                    2 -> sampleCurrent()
+                    3 -> showDiag()
                 }
             }.show()
     }
@@ -804,55 +844,4 @@ class MainActivity : Activity() {
                 1 -> showVoiceDialog()
                 2 -> { prefs.edit().putBoolean("auto", !auto).apply()
                        Toast.makeText(this, if (!auto) "Автообновление включено" else "Автообновление выключено", Toast.LENGTH_SHORT).show() }
-                3 -> { val v = !prefs.getBoolean("sys", false); prefs.edit().putBoolean("sys", v).apply(); failCount = 0
-                       Toast.makeText(this, if (v) "Системное окно голосового ввода" else "Встроенное распознавание", Toast.LENGTH_SHORT).show() }
-                4 -> { wizardSeen.clear(); runSetup() }
-            }
-        }.show()
-    }
-
-    private fun loadHist(): MutableList<JSONObject> {
-        val arr = JSONArray(prefs.getString("h", "[]"))
-        return MutableList(arr.length()) { arr.getJSONObject(it) }
-    }
-
-    private fun saveHist(l: List<JSONObject>) { prefs.edit().putString("h", JSONArray(l).toString()).apply() }
-
-    private fun fav() {
-        val h = loadHist(); if (h.isEmpty()) return
-        val f = !h[0].optBoolean("fav"); h[0].put("fav", f); saveHist(h)
-        Toast.makeText(this, if (f) "★ В избранном" else "Убрано из избранного", Toast.LENGTH_SHORT).show()
-    }
-
-    private fun showHist(onlyFav: Boolean) {
-        val items = loadHist().filter { !onlyFav || it.optBoolean("fav") }
-        if (items.isEmpty()) { Toast.makeText(this, "Пусто", Toast.LENGTH_SHORT).show(); return }
-        val labels = items.map { (if (it.optBoolean("fav")) "★ " else "") + it.getString("time") + "\n" + it.getString("text") + "  →  " + it.getString("tr") }
-        AlertDialog.Builder(this).setTitle(if (onlyFav) "Избранное" else "История")
-            .setItems(labels.toTypedArray()) { _, i ->
-                val h = items[i]
-                spSrc.setSelection(langs.indexOfFirst { it.name == h.getString("src") })
-                spDst.setSelection(langs.indexOfFirst { it.name == h.getString("dst") })
-                botText = h.getString("text"); topText = h.getString("tr")
-                botTv.text = botText; topTv.text = topText
-            }.show()
-    }
-
-    private fun swap() {
-        val a = spSrc.selectedItemPosition; spSrc.setSelection(spDst.selectedItemPosition); spDst.setSelection(a)
-    }
-
-    private fun clearAll() { topText = ""; botText = ""; topTv.text = "Собеседник…"; botTv.text = "Нажмите микрофон" }
-
-    private fun copy(s: String) {
-        (getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("t", s))
-        Toast.makeText(this, "Скопировано", Toast.LENGTH_SHORT).show()
-    }
-
-    override fun onDestroy() {
-        try { unregisterReceiver(installReceiver) } catch (e: Exception) { }
-        try { neural?.release() } catch (e: Throwable) { }
-        rec?.destroy(); tts?.shutdown()
-        super.onDestroy()
-    }
-}
+   
