@@ -844,4 +844,55 @@ class MainActivity : Activity() {
                 1 -> showVoiceDialog()
                 2 -> { prefs.edit().putBoolean("auto", !auto).apply()
                        Toast.makeText(this, if (!auto) "Автообновление включено" else "Автообновление выключено", Toast.LENGTH_SHORT).show() }
-   
+                3 -> { val v = !prefs.getBoolean("sys", false); prefs.edit().putBoolean("sys", v).apply(); failCount = 0
+                       Toast.makeText(this, if (v) "Системное окно голосового ввода" else "Встроенное распознавание", Toast.LENGTH_SHORT).show() }
+                4 -> { wizardSeen.clear(); runSetup() }
+            }
+        }.show()
+    }
+
+    private fun loadHist(): MutableList<JSONObject> {
+        val arr = JSONArray(prefs.getString("h", "[]"))
+        return MutableList(arr.length()) { arr.getJSONObject(it) }
+    }
+
+    private fun saveHist(l: List<JSONObject>) { prefs.edit().putString("h", JSONArray(l).toString()).apply() }
+
+    private fun fav() {
+        val h = loadHist(); if (h.isEmpty()) return
+        val f = !h[0].optBoolean("fav"); h[0].put("fav", f); saveHist(h)
+        Toast.makeText(this, if (f) "★ В избранном" else "Убрано из избранного", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun showHist(onlyFav: Boolean) {
+        val items = loadHist().filter { !onlyFav || it.optBoolean("fav") }
+        if (items.isEmpty()) { Toast.makeText(this, "Пусто", Toast.LENGTH_SHORT).show(); return }
+        val labels = items.map { (if (it.optBoolean("fav")) "★ " else "") + it.getString("time") + "\n" + it.getString("text") + "  →  " + it.getString("tr") }
+        AlertDialog.Builder(this).setTitle(if (onlyFav) "Избранное" else "История")
+            .setItems(labels.toTypedArray()) { _, i ->
+                val h = items[i]
+                spSrc.setSelection(langs.indexOfFirst { it.name == h.getString("src") })
+                spDst.setSelection(langs.indexOfFirst { it.name == h.getString("dst") })
+                botText = h.getString("text"); topText = h.getString("tr")
+                botTv.text = botText; topTv.text = topText
+            }.show()
+    }
+
+    private fun swap() {
+        val a = spSrc.selectedItemPosition; spSrc.setSelection(spDst.selectedItemPosition); spDst.setSelection(a)
+    }
+
+    private fun clearAll() { topText = ""; botText = ""; topTv.text = "Собеседник…"; botTv.text = "Нажмите микрофон" }
+
+    private fun copy(s: String) {
+        (getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("t", s))
+        Toast.makeText(this, "Скопировано", Toast.LENGTH_SHORT).show()
+    }
+
+    override fun onDestroy() {
+        try { unregisterReceiver(installReceiver) } catch (e: Exception) { }
+        try { neural?.release() } catch (e: Throwable) { }
+        rec?.destroy(); tts?.shutdown()
+        super.onDestroy()
+    }
+}
